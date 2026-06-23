@@ -132,6 +132,7 @@ def detect_regression_channel(df, period=60, direction='下降通道', require_b
         "通道空间": f"{channel_width:.1f}%",
         "上轨触碰": f"{upper_touches} 次",
         "下轨触碰": f"{lower_touches} 次",
+        "当前价": round(current_close, 2),
         "距下轨(买点)": f"{dist_to_lower:.2f}%"
     }
 
