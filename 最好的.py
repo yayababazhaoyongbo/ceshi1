@@ -15,7 +15,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ================= 1. 配置中心 =================
 DB_NAME = "market_data_ultimate.db"
 THREAD_COUNT = 20  
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+
+# 【融合进化 1】：从 111.py 引入真实浏览器 UA 池，实现“幽灵”伪装，彻底防封禁
+UA_LIST = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0"
+]
 
 thread_local = threading.local()
 
@@ -47,7 +55,9 @@ def get_data(code):
     try:
         time.sleep(random.uniform(0.01, 0.05))
         session = get_session()
-        resp = session.get(url, timeout=5, headers={"User-Agent": UA}, verify=False)
+        # 每次请求随机抽取一个浏览器身份
+        headers = {"User-Agent": random.choice(UA_LIST)}
+        resp = session.get(url, timeout=5, headers=headers, verify=False)
         data = resp.json()['data'][symbol]
         name = data.get('qt', {}).get(symbol, ["", "未知"])[1]
         
@@ -92,13 +102,11 @@ def calculate_momentum(stock_df, index_df, period=20):
         return stock_return - index_return
     except: return 0
 
-# 新增动态阈值参数传入，用于 AI 进化后的实盘扫描
 def calculate_advanced_indicators(df, dynamic_params=None):
     c = df['收盘']
     v = df['成交量']
-    if len(c) < 260: return False, None, None, None, False
+    if len(c) < 260: return False, None, None, None, False, False
     
-    # 默认阈值
     target_sqz = 100.0
     target_roc = -99.0
     target_vol = 1.5
@@ -115,7 +123,6 @@ def calculate_advanced_indicators(df, dynamic_params=None):
     bbw_max_120 = bbw.rolling(120).max()
     
     squeeze_score = ((bbw.iloc[-1] - bbw_min_120.iloc[-1]) / (bbw_max_120.iloc[-1] - bbw_min_120.iloc[-1] + 1e-9)) * 100
-    # 判断是否满足压缩 (实盘扫描或进化扫描)
     squeeze_on = squeeze_score <= target_sqz if dynamic_params else (bbw.iloc[-1] <= bbw_min_120.iloc[-1] * 1.05)
     
     v_ma3 = v.rolling(3).mean()
@@ -131,9 +138,15 @@ def calculate_advanced_indicators(df, dynamic_params=None):
     hist = macd - signal
     momentum_pulse = hist.iloc[-1] > hist.iloc[-2]
     
+    # 【融合进化 2】：严苛的双金叉判定，提取强反转特征
+    macd_cross = (macd.iloc[-2] < signal.iloc[-2]) and (macd.iloc[-1] > signal.iloc[-1])
+    
     roc12 = (c.diff(12) / c.shift(12)) * 100
     roc_pulse = roc12.iloc[-1] > roc12.iloc[-2]
-    # 如果是进化扫描，需要满足更严苛的ROC绝对值
+    roc_cross = (roc12.iloc[-2] < 0) and (roc12.iloc[-1] > 0)
+    
+    is_double_cross = macd_cross and roc_cross
+    
     if dynamic_params and roc12.iloc[-1] < target_roc:
         roc_pulse = False
     
@@ -148,7 +161,7 @@ def calculate_advanced_indicators(df, dynamic_params=None):
             
     is_spring_loaded = squeeze_on and momentum_pulse and roc_pulse and price_stable and (volume_dry_up or vol_pulse)
     
-    return is_spring_loaded, roc12.iloc[-1], squeeze_score, vol_ratio, annual_support
+    return is_spring_loaded, roc12.iloc[-1], squeeze_score, vol_ratio, annual_support, is_double_cross
 
 # ================= 5. 基建与 UI =================
 def init_db():
@@ -158,7 +171,7 @@ def init_db():
 
 init_db()
 st.set_page_config(layout="wide")
-st.title("🚀 量化狙击系统: 全维融合与AI自进化 V5")
+st.title("🚀 量化狙击系统: 全维融合与AI自进化 V6")
 
 tabs = st.tabs(["🏗️ 基因基建", "⚡ 实盘扫描 (今日打猎)", "⏳ 时光机 (极速回测)", "🧠 AI策略自进化与归因"])
 
@@ -244,10 +257,11 @@ with tabs[1]:
                     if v.iloc[-1] > v_avg.iloc[-1] * vol_m:
                         return {"代码": row['code'], "名称": row['name'], "策略": "三维共振", "形态": tag, "当前价": round(c.iloc[-1], 2)}
             else:
-                is_spring, roc_val, sqz_score, vol_ratio, is_annual_bounce = calculate_advanced_indicators(df)
+                is_spring, roc_val, sqz_score, vol_ratio, is_annual_bounce, is_double_cross = calculate_advanced_indicators(df)
                 if is_spring:
                     tag = "🔴 极致压缩"
                     if is_annual_bounce: tag += " + 🐉年线回踩 (极高胜率)"
+                    if is_double_cross: tag += " + 🌟双金叉反转"
                     return {
                         "代码": row['code'], "名称": row['name'], "形态标签": tag, 
                         "当前价": round(c.iloc[-1], 2), "ROC(12)": f"{roc_val:.2f}%", "压缩评分": f"{sqz_score:.1f}分"
@@ -301,7 +315,6 @@ with tabs[2]:
             c = df_calc['收盘']
             v = df_calc['成交量']
             
-            # --- 构建所有特征矩阵用于归因提取 ---
             ma20 = c.rolling(20).mean()
             std20 = c.rolling(20).std()
             bbw = (4 * std20) / ma20
@@ -317,9 +330,13 @@ with tabs[2]:
             signal = macd.ewm(span=9, adjust=False).mean()
             hist = macd - signal
             momentum_pulse = hist > hist.shift(1)
+            macd_cross = (macd.shift(1) < signal.shift(1)) & (macd > signal)
             
             roc12 = (c.diff(12) / c.shift(12)) * 100
             roc_pulse = roc12 > roc12.shift(1)
+            roc_cross = (roc12.shift(1) < 0) & (roc12 > 0)
+            double_cross_matrix = macd_cross & roc_cross
+            
             price_stable = c > (c.shift(3) * 0.96)
             
             v_ma3 = v.rolling(3).mean()
@@ -329,7 +346,7 @@ with tabs[2]:
             vol_pulse = v > (v_ma3.shift(1) * 1.5)
             
             ma250 = c.rolling(250).mean()
-            dist_ma250_matrix = (c - ma250) / ma250 * 100 # 年线乖离率
+            dist_ma250_matrix = (c - ma250) / ma250 * 100 
             recent_low = c.rolling(5).min() * 0.985
             annual_touch = (recent_low >= ma250 * 0.98) & (recent_low <= ma250 * 1.05) & (c > ma250)
             
@@ -355,13 +372,13 @@ with tabs[2]:
                     
                     tag = "🔴极致压缩" if "前瞻" in backtest_strategy else "🟢三维突破"
                     if annual_touch.iloc[i]: tag += "+🐉年线"
+                    if double_cross_matrix.iloc[i]: tag += "+🌟双金叉"
                     
                     fwd_ret = {}
                     for h in range(1, max_hold + 1):
                         if i + h < len(df_calc): fwd_ret[f'Hold_{h}D'] = (c.iloc[i+h] - trigger_price) / trigger_price * 100
                         else: fwd_ret[f'Hold_{h}D'] = np.nan
                             
-                    # 【核心更新】增加快照保存
                     triggers.append({
                         "代码": row['code'], "名称": name, "形态": tag,
                         "触发日期": trigger_date, "触发价": round(trigger_price, 2),
@@ -403,7 +420,6 @@ with tabs[3]:
         try:
             res_df = pd.read_csv(uploaded_file)
             
-            # 清洗数据算极值
             hold_cols = [col for col in res_df.columns if 'Hold_' in col]
             clean_df = res_df.copy()
             for col in hold_cols:
@@ -412,13 +428,10 @@ with tabs[3]:
             clean_df['最大回撤'] = clean_df[hold_cols].min(axis=1)
             
             if '起爆_Squeeze评分' in clean_df.columns:
-                # 步骤 1: 样本隔离
-                winners = clean_df[clean_df['最高收益'] >= 10.0]  # 大肉组 (>10%)
-                losers = clean_df[clean_df['最大回撤'] <= -5.0]  # 大坑组 (跌超5%)
+                winners = clean_df[clean_df['最高收益'] >= 10.0]  
+                losers = clean_df[clean_df['最大回撤'] <= -5.0]  
                 
                 st.markdown("#### 🔬 第一步：AI 多维特征基因测序对比")
-                
-                # 计算基因差异
                 win_sqz = winners['起爆_Squeeze评分'].median()
                 lose_sqz = losers['起爆_Squeeze评分'].median()
                 win_roc = winners['起爆_ROC'].median()
@@ -434,10 +447,9 @@ with tabs[3]:
                 st.dataframe(pd.DataFrame(compare_data))
                 
                 st.markdown("#### 🧬 第二步：AI 提炼终极进化参数")
-                # 动态自适应设定参数 (比平均大肉特征更严格一点)
-                evolved_sqz = win_sqz * 1.2 # 容错放宽一点点
-                evolved_roc = max(0, win_roc * 0.8) # 取80%门槛
-                evolved_vol = win_vol * 0.9 # 取90%门槛
+                evolved_sqz = win_sqz * 1.2 
+                evolved_roc = max(0, win_roc * 0.8) 
+                evolved_vol = win_vol * 0.9 
                 
                 st.info(f"**AI 分析结论：**\n那些吃大肉的标的，起爆前布林带被压缩得更变态，且动能更为充沛。\n"
                         f"👉 **已自动生成新战法门槛：** 压缩评分必须 <= **{evolved_sqz:.1f}分**，且 ROC >= **{evolved_roc:.2f}%**，且量比 >= **{evolved_vol:.2f}x**。")
@@ -456,11 +468,11 @@ with tabs[3]:
                     def evo_scan_task(row):
                         df, name = get_data(row['code'])
                         if df is not None:
-                            # 传入 AI 进化算出来的严苛字典
-                            is_spring, roc_val, sqz_score, vol_ratio, is_annual = calculate_advanced_indicators(df, dynamic_params)
+                            is_spring, roc_val, sqz_score, vol_ratio, is_annual, is_double_cross = calculate_advanced_indicators(df, dynamic_params)
                             if is_spring:
                                 tag = "🤖 AI严选·压缩起爆"
-                                if is_annual: tag += " + 🐉 年线终极共振"
+                                if is_annual: tag += " + 🐉年线终极共振"
+                                if is_double_cross: tag += " + 🌟双金叉反转"
                                 return {
                                     "代码": row['code'], "名称": name, "形态标签": tag,
                                     "当前价": df['收盘'].iloc[-1], "压缩分": f"{sqz_score:.1f}", 
