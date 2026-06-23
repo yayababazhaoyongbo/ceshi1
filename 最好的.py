@@ -1,5 +1,4 @@
 import streamlit as st
-# 【修复1】页面配置必须放在所有逻辑的第一位，否则云端必卡死
 st.set_page_config(layout="wide", page_title="终极量化狙击系统", page_icon="🎯")
 
 import pandas as pd
@@ -17,7 +16,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= 1. 配置中心 =================
 DB_NAME = "market_data_ultimate.db"
-# 【修复2】降低并发线程数，防止 Streamlit Cloud 1GB 内存溢出导致无限重启
 THREAD_COUNT = 10  
 
 UA_LIST = [
@@ -28,7 +26,6 @@ UA_LIST = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0"
 ]
 
-# 【修复3】使用 Streamlit 的缓存机制管理 Session，防止多线程环境下资源耗尽
 @st.cache_resource
 def get_global_session():
     session = requests.Session()
@@ -71,16 +68,74 @@ def get_data(code):
         data_list = data.get('qfqday', data.get('day', []))
         if len(data_list) < 60: return None, None
         
-        df = pd.DataFrame(data_list).iloc[:, [0, 2, 5]]
-        df.columns = ['日期', '收盘', '成交量']
-        df[['收盘', '成交量']] = df[['收盘', '成交量']].apply(pd.to_numeric)
+        df = pd.DataFrame(data_list).iloc[:, [0, 1, 2, 3, 4, 5]]
+        df.columns = ['日期', '开盘', '收盘', '最高', '最低', '成交量']
+        df[['开盘', '收盘', '最高', '最低', '成交量']] = df[['开盘', '收盘', '最高', '最低', '成交量']].apply(pd.to_numeric)
         
-        df['最低'] = df['收盘'] * 0.985 
         return df, name
     except Exception: 
         return None, None
 
-# ================= 3. 灵魂均线核心算法 =================
+# ================= 3. 通道震荡算法 (本次新增核心) =================
+def detect_regression_channel(df, period=60, direction='下降通道', require_bottom=True):
+    """
+    通过线性回归识别规律性的通道震荡形态
+    """
+    if len(df) < period:
+        return None
+        
+    df_slice = df.tail(period)
+    x = np.arange(period)
+    y = df_slice['收盘'].values
+    
+    # 计算归一化斜率 (判断是大趋势向上还是向下)
+    y_norm = y / y[0]
+    slope_norm, _ = np.polyfit(x, y_norm, 1)
+    
+    if direction == '下降通道' and slope_norm > -0.002: return None
+    if direction == '上升通道' and slope_norm < 0.002: return None
+    
+    # 真实线性回归画出通道中轴线
+    slope, intercept = np.polyfit(x, y, 1)
+    reg_line = slope * x + intercept
+    
+    # 用1.5倍标准差画出通道上下轨
+    std_dev = np.std(y - reg_line)
+    upper_band = reg_line + 1.5 * std_dev
+    lower_band = reg_line - 1.5 * std_dev
+    
+    highs = df_slice['最高'].values
+    lows = df_slice['最低'].values
+    
+    # 统计触碰次数 (留有1.5%的容错空间)
+    upper_touches = np.sum(highs >= upper_band * 0.985)
+    lower_touches = np.sum(lows <= lower_band * 1.015)
+    
+    # 规律要求：必须是老手，至少碰过2次上轨和2次下轨
+    if upper_touches < 2 or lower_touches < 2:
+        return None
+        
+    # 通道宽度必须足够（上下轨空间大于10%），否则波段没肉吃
+    channel_width = (upper_band[-1] - lower_band[-1]) / lower_band[-1] * 100
+    if channel_width < 10:
+        return None
+        
+    # 买点判定：目前价格必须跌到了下轨附近 (3%以内)
+    current_close = y[-1]
+    dist_to_lower = (current_close - lower_band[-1]) / lower_band[-1] * 100
+    
+    if require_bottom and (dist_to_lower > 3.0 or dist_to_lower < -2.0):
+        return None
+        
+    return {
+        "通道方向": "↘️ 下降震荡" if slope_norm < 0 else "↗️ 上升震荡",
+        "通道空间": f"{channel_width:.1f}%",
+        "上轨触碰": f"{upper_touches} 次",
+        "下轨触碰": f"{lower_touches} 次",
+        "距下轨(买点)": f"{dist_to_lower:.2f}%"
+    }
+
+# ================= 4. 旧版指标计算保留 (不修改原有逻辑) =================
 def find_best_ma(df):
     best_ma = 0
     best_score = -9999
@@ -95,7 +150,6 @@ def find_best_ma(df):
             best_ma = period
     return best_ma, best_score
 
-# ================= 4. 高级量化指标计算 =================
 def calculate_volatility(df, period=60):
     returns = df['收盘'].pct_change().dropna()
     volatility = returns.tail(period).std() * np.sqrt(252)
@@ -182,7 +236,6 @@ def calculate_advanced_indicators(df, dynamic_params=None):
     return is_spring_loaded, roc12.iloc[-1], squeeze_score, vol_ratio, annual_support, is_double_cross
 
 # ================= 5. 基建与 UI =================
-# 【修复4】在 Streamlit 云端，初始化数据库函数必须安全，加上 timeout=15 防锁
 @st.cache_resource
 def init_db():
     try:
@@ -194,16 +247,16 @@ def init_db():
     except Exception as e:
         return False
 
-# 确保启动时只执行一次数据库检查
 db_ready = init_db()
 
-st.title("🚀 量化狙击系统: 终极云端稳定版")
+st.title("🚀 量化狙击系统: 全地形终极版")
 
 if not db_ready:
     st.error("云端存储环境初始化失败，请稍后刷新重试。")
     st.stop()
 
-tabs = st.tabs(["🏗️ 基因基建", "⚡ 实盘扫描", "⏳ 时光机 (全量回测)", "🏆 归因分析提炼"])
+# 【全新结构】：增加 Tab 5 专为规律通道服务
+tabs = st.tabs(["🏗️ 基因基建", "⚡ 实盘扫描", "⏳ 时光机回测", "🏆 归因提炼", "📈 规律通道猎手"])
 
 # ----------------- Tab 1: 基因基建 -----------------
 with tabs[0]:
@@ -248,8 +301,12 @@ with tabs[0]:
 
 # ----------------- Tab 2: 实盘扫描 -----------------
 with tabs[1]:
-    st.markdown("### 今日实时策略扫描")
-    strategy_choice = st.radio("选择狙击策略:", ["三维共振 (右侧均线突破)", "前瞻预判 (左侧形态压缩)"], horizontal=True)
+    st.markdown("### 今日实时策略扫描 (主升浪探测器)")
+    strategy_choice = st.radio("选择狙击策略:", [
+        "三维共振 (右侧均线突破)", 
+        "前瞻预判 (左侧形态压缩)",
+        "💥 跳空爆发 (缺口+大阳线)"
+    ], horizontal=True)
     
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -276,7 +333,8 @@ with tabs[1]:
             df, name = get_data(row['code'])
             if df is None or len(df) < 260: return None
             
-            c, v = df['收盘'], df['成交量']
+            O, C, H, L, V = df['开盘'], df['收盘'], df['最高'], df['最低'], df['成交量']
+            
             if "三维共振" in strategy_choice:
                 volatility = calculate_volatility(df)
                 if volatility > max_vol: return None
@@ -284,13 +342,33 @@ with tabs[1]:
                 if momentum * 100 < min_mom: return None
                 
                 best_ma_period = row['best_ma'] if pd.notna(row['best_ma']) else 60
-                ema_soul = c.ewm(span=best_ma_period, adjust=False).mean()
+                ema_soul = C.ewm(span=best_ma_period, adjust=False).mean()
                 
-                if c.iloc[-1] > ema_soul.iloc[-1] and c.iloc[-2] <= ema_soul.iloc[-2]:
-                    v_avg = v.shift(1).rolling(20).mean()
-                    if v.iloc[-1] > v_avg.iloc[-1] * vol_m:
-                        return {"代码": row['code'], "名称": row['name'], "策略": "三维共振", "当前价": round(c.iloc[-1], 2)}
-            else:
+                if C.iloc[-1] > ema_soul.iloc[-1] and C.iloc[-2] <= ema_soul.iloc[-2]:
+                    v_avg = V.shift(1).rolling(20).mean()
+                    if V.iloc[-1] > v_avg.iloc[-1] * vol_m:
+                        return {"代码": row['code'], "名称": row['name'], "策略": "三维共振", "当前价": round(C.iloc[-1], 2)}
+                        
+            elif "跳空爆发" in strategy_choice:
+                gap_pct = (O.iloc[-1] - C.iloc[-2]) / C.iloc[-2] * 100
+                is_gap_up = (O.iloc[-1] > H.iloc[-2]) or (gap_pct > 2.0)
+                is_solid_green = C.iloc[-1] > O.iloc[-1]
+                v_avg = V.shift(1).rolling(20).mean()
+                is_vol_surge = V.iloc[-1] >= v_avg.iloc[-1] * vol_m
+                ma20 = C.rolling(20).mean()
+                is_uptrend = C.iloc[-1] > ma20.iloc[-1]
+                
+                if is_gap_up and is_solid_green and is_vol_surge and is_uptrend:
+                    return {
+                        "代码": row['code'], 
+                        "名称": row['name'], 
+                        "形态标签": "💥 N字起爆+向上缺口", 
+                        "当前价": round(C.iloc[-1], 2), 
+                        "跳空幅度": f"{gap_pct:.2f}%", 
+                        "量比": f"{(V.iloc[-1]/v_avg.iloc[-1]):.2f}x"
+                    }
+                    
+            else: 
                 dyn_params = {"reject_downtrend": reject_knife}
                 is_spring, roc_val, sqz_score, vol_ratio, is_annual_bounce, is_double_cross = calculate_advanced_indicators(df, dyn_params)
                 if is_spring:
@@ -299,7 +377,7 @@ with tabs[1]:
                     if is_double_cross: tag += " + 🌟双金叉"
                     return {
                         "代码": row['code'], "名称": row['name'], "形态标签": tag, 
-                        "当前价": round(c.iloc[-1], 2), "ROC(12)": f"{roc_val:.2f}%", "压缩评分": f"{sqz_score:.1f}分"
+                        "当前价": round(C.iloc[-1], 2), "ROC(12)": f"{roc_val:.2f}%", "压缩评分": f"{sqz_score:.1f}分"
                     }
             return None
 
@@ -324,7 +402,7 @@ with tabs[2]:
     col_t1, col_t2, col_t3 = st.columns(3)
     with col_t1: lookback_days = st.number_input("扫描过去多少天？", min_value=5, max_value=100, value=30, step=5)
     with col_t2: max_hold = st.number_input("验证未来几天收益？", min_value=3, max_value=30, value=10, step=1)
-    with col_t3: backtest_strategy = st.selectbox("要验证的策略内核", ["前瞻预判 (左侧)", "三维共振 (右侧)"])
+    with col_t3: backtest_strategy = st.selectbox("要验证的策略内核", ["前瞻预判 (左侧)", "三维共振 (右侧)", "跳空爆发 (缺口)"])
     
     if st.button("🚀 启动全域时光机回测"):
         conn = sqlite3.connect(DB_NAME, timeout=15)
@@ -346,21 +424,20 @@ with tabs[2]:
                 idx_ret_20 = idx_c.pct_change(20)
             else: idx_ret_20 = 0
                 
-            c = df_calc['收盘']
-            v = df_calc['成交量']
+            O, C, H, L, V = df_calc['开盘'], df_calc['收盘'], df_calc['最高'], df_calc['最低'], df_calc['成交量']
             
-            ma20 = c.rolling(20).mean()
-            ma60 = c.rolling(60).mean()
+            ma20 = C.rolling(20).mean()
+            ma60 = C.rolling(60).mean()
             
             ma20_slope_matrix = (ma20 - ma20.shift(10)) / ma20.shift(10)
             is_falling_knife_matrix = (ma20_slope_matrix < -0.02)
             
             ma60_slope_matrix = (ma60 - ma60.shift(20)) / ma60.shift(20)
-            is_macro_downtrend_matrix = (ma60_slope_matrix < -0.01) & (c < ma60)
+            is_macro_downtrend_matrix = (ma60_slope_matrix < -0.01) & (C < ma60)
             
             reject_mask = is_falling_knife_matrix | is_macro_downtrend_matrix
             
-            std20 = c.rolling(20).std()
+            std20 = C.rolling(20).std()
             bbw = (4 * std20) / ma20
             bbw_min_120 = bbw.rolling(120).min()
             bbw_max_120 = bbw.rolling(120).max()
@@ -368,59 +445,74 @@ with tabs[2]:
             sqz_score_matrix = ((bbw - bbw_min_120) / (bbw_max_120 - bbw_min_120 + 1e-9)) * 100
             squeeze_on = (sqz_score_matrix <= 0.15)
             
-            exp1 = c.ewm(span=12, adjust=False).mean()
-            exp2 = c.ewm(span=26, adjust=False).mean()
+            exp1 = C.ewm(span=12, adjust=False).mean()
+            exp2 = C.ewm(span=26, adjust=False).mean()
             macd = exp1 - exp2
             signal = macd.ewm(span=9, adjust=False).mean()
             hist = macd - signal
             momentum_pulse = hist > hist.shift(1)
             macd_cross = (macd.shift(1) < signal.shift(1)) & (macd > signal)
             
-            roc12 = (c.diff(12) / c.shift(12)) * 100
+            roc12 = (C.diff(12) / C.shift(12)) * 100
             roc_pulse = (roc12 > roc12.shift(1)) & (roc12 >= 2.5)
             roc_cross = (roc12.shift(1) < 0) & (roc12 > 0)
             double_cross_matrix = macd_cross & roc_cross
             
-            price_stable = c > (c.shift(3) * 0.96)
+            price_stable = C > (C.shift(3) * 0.96)
             
-            v_ma3 = v.rolling(3).mean()
-            v_ma20 = v.rolling(20).mean()
-            vol_ratio_matrix = v / v_ma20
+            v_ma3 = V.rolling(3).mean()
+            v_ma20 = V.rolling(20).mean()
+            vol_ratio_matrix = V / v_ma20
             volume_dry_up = v_ma3.shift(1) < (v_ma20.shift(1) * 0.70)
             vol_pulse = (vol_ratio_matrix >= 1.7)
             
-            ma250 = c.rolling(250).mean()
-            dist_ma250_matrix = (c - ma250) / ma250 * 100 
-            recent_low = c.rolling(5).min() * 0.985
-            annual_touch = (recent_low >= ma250 * 0.98) & (recent_low <= ma250 * 1.05) & (c > ma250)
+            ma250 = C.rolling(250).mean()
+            dist_ma250_matrix = (C - ma250) / ma250 * 100 
+            recent_low = C.rolling(5).min() * 0.985
+            annual_touch = (recent_low >= ma250 * 0.98) & (recent_low <= ma250 * 1.05) & (C > ma250)
             
             left_signal = squeeze_on & momentum_pulse & roc_pulse & price_stable & (volume_dry_up | vol_pulse) & (~reject_mask)
             
-            vol_array = c.pct_change().rolling(60).std() * np.sqrt(252)
-            mom_array = c.pct_change(20) - idx_ret_20
+            vol_array = C.pct_change().rolling(60).std() * np.sqrt(252)
+            mom_array = C.pct_change(20) - idx_ret_20
             best_ma = row['best_ma'] if pd.notna(row['best_ma']) else 60
-            ema = c.ewm(span=best_ma, adjust=False).mean()
-            cross_up = (c > ema) & (c.shift(1) <= ema.shift(1))
-            v_avg = v.shift(1).rolling(20).mean()
-            vol_break = v > (v_avg * 1.5)
+            ema = C.ewm(span=best_ma, adjust=False).mean()
+            cross_up = (C > ema) & (C.shift(1) <= ema.shift(1))
+            v_avg = V.shift(1).rolling(20).mean()
+            vol_break = V > (v_avg * 1.5)
             right_signal = (vol_array <= 0.4) & (mom_array * 100 >= 5) & cross_up & vol_break
             
-            target_signal = right_signal if "三维" in backtest_strategy else left_signal
+            gap_pct_matrix = (O - C.shift(1)) / C.shift(1) * 100
+            gap_up_matrix = (O > H.shift(1)) | (gap_pct_matrix > 2.0)
+            solid_yang_matrix = C > O
+            gap_vol_surge_matrix = V >= (v_avg * 1.5)
+            uptrend_matrix = C > ma20
+            gap_signal = gap_up_matrix & solid_yang_matrix & gap_vol_surge_matrix & uptrend_matrix
+            
+            if "三维" in backtest_strategy:
+                target_signal = right_signal
+            elif "跳空" in backtest_strategy:
+                target_signal = gap_signal
+            else:
+                target_signal = left_signal
             
             triggers = []
             start_idx = max(260, len(df_calc) - lookback_days)
             for i in range(start_idx, len(df_calc)):
                 if target_signal.iloc[i]:
                     trigger_date = df_calc['日期'].iloc[i]
-                    trigger_price = c.iloc[i]
+                    trigger_price = C.iloc[i]
                     
-                    tag = "🔴极致压缩" if "前瞻" in backtest_strategy else "🟢三维突破"
-                    if annual_touch.iloc[i]: tag += "+🐉年线"
-                    if double_cross_matrix.iloc[i]: tag += "+🌟双金叉"
+                    if "跳空" in backtest_strategy:
+                        tag = "💥缺口爆发"
+                    else:
+                        tag = "🔴极致压缩" if "前瞻" in backtest_strategy else "🟢三维突破"
+                        if annual_touch.iloc[i]: tag += "+🐉年线"
+                        if double_cross_matrix.iloc[i]: tag += "+🌟双金叉"
                     
                     fwd_ret = {}
                     for h in range(1, max_hold + 1):
-                        if i + h < len(df_calc): fwd_ret[f'Hold_{h}D'] = (c.iloc[i+h] - trigger_price) / trigger_price * 100
+                        if i + h < len(df_calc): fwd_ret[f'Hold_{h}D'] = (C.iloc[i+h] - trigger_price) / trigger_price * 100
                         else: fwd_ret[f'Hold_{h}D'] = np.nan
                             
                     triggers.append({
@@ -444,7 +536,7 @@ with tabs[2]:
                     status_text.text(f"时光机采集样本中... 进度: {i+1} / {len(genes)} | 🎯 收集信号: {len(hits)} 个")
                     
         test_bar.progress(1.0)
-        status_text.text(f"回测完毕。生成 {len(hits)} 份历史样本。请下载 CSV 去 Tab 4 归因分析！")
+        status_text.text(f"回测完毕。生成 {len(hits)} 份历史样本。")
         if hits:
             res_df = pd.DataFrame(hits)
             csv_data = res_df.to_csv(index=False).encode('utf-8-sig')
@@ -453,7 +545,7 @@ with tabs[2]:
             st.balloons()
         else: st.info("该区间内无股票触发策略。")
 
-# ----------------- Tab 4: 归因分析提炼 (人机协作核心) -----------------
+# ----------------- Tab 4: 归因分析提炼 -----------------
 with tabs[3]:
     st.markdown("### 🏆 数据归因与提炼 (专为喂给大模型设计)")
     
@@ -484,36 +576,60 @@ with tabs[3]:
                     st.error(f"☠️ 失败组 (最大跌幅<-5%且未曾大涨): 共 {len(losers)} 只")
                     if not losers.empty:
                         st.dataframe(losers[['名称', '触发日期', '起爆_Squeeze评分', '起爆_ROC', '最大跌幅']])
-                
-                st.divider()
-                st.markdown("#### 🤖 专属 AI 沟通报告")
-                
-                win_sqz = winners['起爆_Squeeze评分'].median() if not winners.empty else 0
-                win_roc = winners['起爆_ROC'].median() if not winners.empty else 0
-                win_vol = winners['起爆_量比'].median() if not winners.empty else 0
-                
-                lose_sqz = losers['起爆_Squeeze评分'].median() if not losers.empty else 0
-                lose_roc = losers['起爆_ROC'].median() if not losers.empty else 0
-                lose_vol = losers['起爆_量比'].median() if not losers.empty else 0
-                
-                report_text = (
-                    f"你好！我刚刚用系统对历史进行了回测归因，得到了以下量化特征对比数据，请帮我分析并修改Python代码的过滤参数：\n\n"
-                    f"【成功起爆的股票特征 (涨幅>10%)】\n"
-                    f"- 启动前布林带压缩评分中位数：{win_sqz:.2f}分\n"
-                    f"- 启动前 ROC(12) 动量中位数：{win_roc:.2f}%\n"
-                    f"- 启动当量比中位数：{win_vol:.2f}x\n\n"
-                    f"【失败被套的股票特征 (跌幅>-5%且未涨)】\n"
-                    f"- 启动前布林带压缩评分中位数：{lose_sqz:.2f}分\n"
-                    f"- 启动前 ROC(12) 动量中位数：{lose_roc:.2f}%\n"
-                    f"- 启动当量比中位数：{lose_vol:.2f}x\n\n"
-                    f"我的诉求：\n"
-                    f"1. 请根据上述数据对比，帮我找出成功组和失败组最明显的区分点。\n"
-                    f"2. 请帮我给出更严格的代码替换方案，以便滤除那些失败组特征的杂鱼股票。"
-                )
-                
-                st.text_area("📋 报告内容 (请复制发送给AI)：", value=report_text, height=350)
-                
             else:
-                st.error("您上传的 CSV 不包含起爆特征。请去 Tab 3 跑一次最新的时光机并下载 CSV！")
+                st.error("您上传的 CSV 不包含起爆特征。")
         except Exception as e:
             st.error(f"分析失败: {e}")
+
+# ----------------- Tab 5: 规律通道猎手 (本次专属新增) -----------------
+with tabs[4]:
+    st.markdown("### 📈 规律通道挖掘 (高抛低吸神器)")
+    st.markdown("专供波段玩家！通过**线性回归 (Linear Regression)**算法，找出那些在通道内规规矩矩震荡的股票，并且筛选出目前价格刚好跌到**通道下轨（买点）**的绝佳标的。")
+    
+    col_c1, col_c2, col_c3 = st.columns(3)
+    with col_c1:
+        channel_dir = st.selectbox("选择要寻找的通道方向:", ["下降通道", "上升通道"])
+    with col_c2:
+        channel_period = st.slider("通道形成周期 (天)", 30, 120, 60, 10)
+    with col_c3:
+        only_bottom = st.checkbox("🎯 仅显示刚跌到通道下轨附近的股票", value=True)
+        
+    if st.button("🔍 开始挖掘通道规律股"):
+        conn = sqlite3.connect(DB_NAME, timeout=15)
+        genes = pd.read_sql("SELECT * FROM stock_genes", conn)
+        conn.close()
+        
+        c_bar = st.progress(0.0)
+        c_status = st.empty()
+        c_hits = []
+        
+        def channel_scan_task(row):
+            df, name = get_data(row['code'])
+            if df is not None:
+                res = detect_regression_channel(df, period=channel_period, direction=channel_dir, require_bottom=only_bottom)
+                if res:
+                    res["代码"] = row['code']
+                    res["名称"] = name
+                    return res
+            return None
+
+        with ThreadPoolExecutor(max_workers=THREAD_COUNT) as ex:
+            futs = [ex.submit(channel_scan_task, r) for _, r in genes.iterrows()]
+            for i, f in enumerate(as_completed(futs)):
+                res = f.result()
+                if res: c_hits.append(res)
+                if len(genes) > 0 and i % 10 == 0: 
+                    c_bar.progress((i+1)/len(genes))
+                    c_status.text(f"正在拟合线性回归通道... 进度: {i+1} / {len(genes)} | 🎯 发现通道股: {len(c_hits)} 个")
+                    
+        c_bar.progress(1.0)
+        c_status.text(f"扫描完毕！找到 {len(c_hits)} 个符合规律震荡特征的标的。")
+        
+        if c_hits:
+            st.balloons()
+            # 调整列顺序美化显示
+            df_display = pd.DataFrame(c_hits)[["代码", "名称", "通道方向", "通道空间", "上轨触碰", "下轨触碰", "当前价", "距下轨(买点)"]]
+            st.dataframe(df_display)
+            st.info("💡 **波段操作指南**：【距下轨】的值越接近 0%，说明它此刻越贴近支撑位，买入的安全边际越高；【通道空间】代表了它未来反弹到上轨时的理论利润空间。")
+        else:
+            st.warning("当前市场没找到符合这种规律震荡的股票，或者您可以尝试放宽『通道形成周期』。")
