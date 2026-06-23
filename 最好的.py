@@ -305,13 +305,12 @@ def init_db():
 
 db_ready = init_db()
 
-st.title("🚀 量化狙击系统: 画线辅助完美落地版")
+st.title("🚀 量化狙击系统: 终极全视界版")
 
 if not db_ready:
     st.error("云端存储环境初始化失败，请稍后刷新重试。")
     st.stop()
 
-# 【全新结构】：增加 Tab 6 画线坐标定位
 tabs = st.tabs(["🏗️ 基因基建", "⚡ 实盘扫描", "⏳ 时光机回测", "🏆 归因提炼", "📈 规律通道猎手", "📐 画线辅助(寻点)"])
 
 # ----------------- Tab 1: 基因基建 -----------------
@@ -689,9 +688,8 @@ with tabs[4]:
 
 # ----------------- Tab 6: 画线辅助(寻点) -----------------
 with tabs[5]:
-    st.markdown("### 📐 通道画线辅助 (精准定位触碰点)")
-    st.markdown("在这里输入从 **Tab 5** 扫描出来的股票代码和【实际天数】，系统将为您提取每一次触碰上下轨的具体日期和价格。")
-    st.info("💡 **画线诀窍**：在您的炒股软件中，用画线工具连接【上轨触碰日】中最早和最晚的两个最高点，即可画出上轨阻力线；同理连接【下轨触碰日】中的最低点即可画出支撑线。")
+    st.markdown("### 📐 通道画线辅助 (傻瓜式直线定位)")
+    st.markdown("在这里输入从 **Tab 5** 扫描出来的股票代码和【实际天数】，系统将直接给出画出这条通道的**两个绝对坐标点**，您只需在软件中连接这两点即可！")
     
     col_d1, col_d2 = st.columns(2)
     with col_d1:
@@ -699,7 +697,7 @@ with tabs[5]:
     with col_d2:
         draw_period = st.number_input("输入 Tab 5 中的【实际天数】(或大/小通道天数)", min_value=20, max_value=400, value=60)
 
-    if st.button("📍 获取精准画线坐标"):
+    if st.button("📍 提取直线绝对坐标"):
         if draw_code:
             df, name = get_data(draw_code)
             if df is not None and len(df) >= draw_period:
@@ -710,7 +708,7 @@ with tabs[5]:
                 x = np.arange(int(draw_period))
                 y = df_slice['收盘'].values
 
-                # 进行线性回归还原通道 (和底层核心算法完全一致)
+                # 进行线性回归还原理论通道
                 slope, intercept = np.polyfit(x, y, 1)
                 reg_line = slope * x + intercept
 
@@ -718,31 +716,50 @@ with tabs[5]:
                 upper_band = reg_line + 1.6 * std_dev
                 lower_band = reg_line - 1.6 * std_dev
 
-                df_slice['中轴'] = np.round(reg_line, 2)
                 df_slice['理论上轨'] = np.round(upper_band, 2)
                 df_slice['理论下轨'] = np.round(lower_band, 2)
 
-                # 提取触碰点 (和扫描底层的容错率0.985/1.015保持一致)
+                # 【终极升级：提取直线的绝对起止坐标】
+                start_date = df_slice['日期'].iloc[0]
+                end_date = df_slice['日期'].iloc[-1]
+                
+                up_start_val = df_slice['理论上轨'].iloc[0]
+                up_end_val = df_slice['理论上轨'].iloc[-1]
+                
+                dn_start_val = df_slice['理论下轨'].iloc[0]
+                dn_end_val = df_slice['理论下轨'].iloc[-1]
+
+                st.success(f"✅ [{draw_code} {name}] 完美回归通道计算完成！")
+
+                st.markdown("#### ✏️ 请在您的炒股软件中使用【画线工具(线段)】，直接连接以下两点：")
+                
+                st.info(f"🔴 **画【上轨阻力线】**：\n\n"
+                        f"起点：寻找日期 **{start_date}**，将鼠标悬停在价格 **{up_start_val}** 处点下起点。\n\n"
+                        f"终点：寻找日期 **{end_date}**，将鼠标悬停在价格 **{up_end_val}** 处连线。")
+
+                st.success(f"🟢 **画【下轨支撑线】**：\n\n"
+                           f"起点：寻找日期 **{start_date}**，将鼠标悬停在价格 **{dn_start_val}** 处点下起点。\n\n"
+                           f"终点：寻找日期 **{end_date}**，将鼠标悬停在价格 **{dn_end_val}** 处连线。")
+                
+                st.markdown("---")
+                
+                # 保留历史触碰点作为参考
                 upper_touches = df_slice[df_slice['最高'] >= df_slice['理论上轨'] * 0.985]
                 lower_touches = df_slice[df_slice['最低'] <= df_slice['理论下轨'] * 1.015]
+                
+                with st.expander("点击查看这段期间内，股票实际触碰边界的历史明细"):
+                    col_u, col_l = st.columns(2)
+                    with col_u:
+                        st.markdown("##### 历史触碰上轨(阻力)记录")
+                        if not upper_touches.empty:
+                            st.dataframe(upper_touches[['日期', '最高', '理论上轨']].style.format({"最高": "{:.2f}", "理论上轨": "{:.2f}"}), use_container_width=True)
+                        else: st.write("无")
+                    with col_l:
+                        st.markdown("##### 历史触碰下轨(支撑)记录")
+                        if not lower_touches.empty:
+                            st.dataframe(lower_touches[['日期', '最低', '理论下轨']].style.format({"最低": "{:.2f}", "理论下轨": "{:.2f}"}), use_container_width=True)
+                        else: st.write("无")
 
-                st.success(f"✅ [{draw_code} {name}] 最近 {draw_period} 天通道解析完成！")
-
-                col_u, col_l = st.columns(2)
-                with col_u:
-                    st.markdown("#### 🔴 上轨触碰日 (阻力点/高抛点)")
-                    if not upper_touches.empty:
-                        # 格式化日期显示，过滤多余列
-                        st.dataframe(upper_touches[['日期', '最高', '理论上轨']].style.format({"最高": "{:.2f}", "理论上轨": "{:.2f}"}), use_container_width=True)
-                    else:
-                        st.warning("未检测到上轨触碰")
-
-                with col_l:
-                    st.markdown("#### 🟢 下轨触碰日 (支撑点/低吸点)")
-                    if not lower_touches.empty:
-                        st.dataframe(lower_touches[['日期', '最低', '理论下轨']].style.format({"最低": "{:.2f}", "理论下轨": "{:.2f}"}), use_container_width=True)
-                    else:
-                        st.warning("未检测到下轨触碰")
             else:
                 st.error("股票代码无效或数据不足，请检查输入！")
         else:
