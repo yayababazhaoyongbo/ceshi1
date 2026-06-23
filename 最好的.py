@@ -52,10 +52,17 @@ def get_data(code):
         
     url = f"https://web.ifzq.gtimg.cn/appstock/app/newfqkline/get?param={symbol},day,,,500,qfq"
     try:
+        # 增加极其微小的休眠防封禁
         time.sleep(random.uniform(0.01, 0.05))
         session = get_session()
         headers = {"User-Agent": random.choice(UA_LIST)}
+        # 设置明确的 timeout 防卡死
         resp = session.get(url, timeout=5, headers=headers, verify=False)
+        
+        # 增加异常判断，防止解析 JSON 时报错
+        if resp.status_code != 200:
+            return None, None
+            
         data = resp.json()['data'][symbol]
         name = data.get('qt', {}).get(symbol, ["", "未知"])[1]
         
@@ -70,7 +77,9 @@ def get_data(code):
         
         df['最低'] = df['收盘'] * 0.985 
         return df, name
-    except: return None, None
+    except Exception as e: 
+        # 捕获所有异常，确保遇到脏数据不会崩溃
+        return None, None
 
 # ================= 3. 灵魂均线核心算法 =================
 def find_best_ma(df):
@@ -105,6 +114,7 @@ def calculate_advanced_indicators(df, dynamic_params=None):
     v = df['成交量']
     if len(c) < 260: return False, None, None, None, False, False
     
+    # 【这里的阈值是关键，根据之前的归因报告，我把它锁死在最严苛的状态】
     target_sqz = 0.15   
     target_roc = 2.5    
     target_vol = 1.7    
@@ -119,13 +129,9 @@ def calculate_advanced_indicators(df, dynamic_params=None):
     ma20 = c.rolling(20).mean()
     ma60 = c.rolling(60).mean()
     
-    # 【终极修正 1：防断崖式飞刀】
-    # 扩大监控周期，如果过去10天MA20跌幅超过2%，视为正在加速暴跌
     ma20_slope_10d = (ma20.iloc[-1] - ma20.iloc[-10]) / ma20.iloc[-10] if pd.notna(ma20.iloc[-10]) else 0
     is_falling_knife = (ma20_slope_10d < -0.02)
     
-    # 【终极修正 2：防阴跌下降通道 (解决您的截图问题)】
-    # 看过去20天(一个月)的MA60斜率。如果不仅被MA60压制，且MA60整体在下滑，说明是下降通道。
     ma60_slope_20d = (ma60.iloc[-1] - ma60.iloc[-20]) / ma60.iloc[-20] if pd.notna(ma60.iloc[-20]) else 0
     price_suppressed_by_60 = c.iloc[-1] < ma60.iloc[-1]
     is_macro_downtrend = (ma60_slope_20d < -0.01) and price_suppressed_by_60
@@ -170,7 +176,6 @@ def calculate_advanced_indicators(df, dynamic_params=None):
         if (recent_low >= ma250.iloc[-1] * 0.98) and (recent_low <= ma250.iloc[-1] * 1.05) and (c.iloc[-1] > ma250.iloc[-1]):
             annual_support = True
             
-    # 【双重封锁】：不仅防飞刀，也防下降通道
     if reject_downtrend and (is_falling_knife or is_macro_downtrend):
         is_spring_loaded = False
     else:
@@ -186,7 +191,7 @@ def init_db():
 
 init_db()
 st.set_page_config(layout="wide")
-st.title("🚀 量化狙击系统: 终极下降通道阻断版")
+st.title("🚀 量化狙击系统: 终极防崩溃版")
 
 tabs = st.tabs(["🏗️ 基因基建", "⚡ 实盘扫描", "⏳ 时光机 (全量回测)", "🏆 归因分析提炼"])
 
@@ -332,14 +337,12 @@ with tabs[2]:
             ma20 = c.rolling(20).mean()
             ma60 = c.rolling(60).mean()
             
-            # 【同步修复时光机的矩阵运算：下降通道封锁网】
             ma20_slope_matrix = (ma20 - ma20.shift(10)) / ma20.shift(10)
             is_falling_knife_matrix = (ma20_slope_matrix < -0.02)
             
             ma60_slope_matrix = (ma60 - ma60.shift(20)) / ma60.shift(20)
             is_macro_downtrend_matrix = (ma60_slope_matrix < -0.01) & (c < ma60)
             
-            # 把两把刀合并成一个过滤面具
             reject_mask = is_falling_knife_matrix | is_macro_downtrend_matrix
             
             std20 = c.rolling(20).std()
@@ -348,7 +351,9 @@ with tabs[2]:
             bbw_max_120 = bbw.rolling(120).max()
             
             sqz_score_matrix = ((bbw - bbw_min_120) / (bbw_max_120 - bbw_min_120 + 1e-9)) * 100
-            squeeze_on = bbw <= (bbw_min_120 * 1.05)
+            
+            # 【这里也同步应用最严苛的归因数据阈值】
+            squeeze_on = (sqz_score_matrix <= 0.15)
             
             exp1 = c.ewm(span=12, adjust=False).mean()
             exp2 = c.ewm(span=26, adjust=False).mean()
@@ -359,7 +364,9 @@ with tabs[2]:
             macd_cross = (macd.shift(1) < signal.shift(1)) & (macd > signal)
             
             roc12 = (c.diff(12) / c.shift(12)) * 100
-            roc_pulse = roc12 > roc12.shift(1)
+            
+            # 【这里同步应用最严苛的ROC大于2.5%】
+            roc_pulse = (roc12 > roc12.shift(1)) & (roc12 >= 2.5)
             roc_cross = (roc12.shift(1) < 0) & (roc12 > 0)
             double_cross_matrix = macd_cross & roc_cross
             
@@ -369,14 +376,15 @@ with tabs[2]:
             v_ma20 = v.rolling(20).mean()
             vol_ratio_matrix = v / v_ma20
             volume_dry_up = v_ma3.shift(1) < (v_ma20.shift(1) * 0.70)
-            vol_pulse = v > (v_ma3.shift(1) * 1.5)
+            
+            # 【这里同步应用最严苛的量比1.7倍】
+            vol_pulse = (vol_ratio_matrix >= 1.7)
             
             ma250 = c.rolling(250).mean()
             dist_ma250_matrix = (c - ma250) / ma250 * 100 
             recent_low = c.rolling(5).min() * 0.985
             annual_touch = (recent_low >= ma250 * 0.98) & (recent_low <= ma250 * 1.05) & (c > ma250)
             
-            # 加入 (~reject_mask) 取反，彻底拦截下降通道标的
             left_signal = squeeze_on & momentum_pulse & roc_pulse & price_stable & (volume_dry_up | vol_pulse) & (~reject_mask)
             
             vol_array = c.pct_change().rolling(60).std() * np.sqrt(252)
