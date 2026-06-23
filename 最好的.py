@@ -76,56 +76,39 @@ def get_data(code):
     except Exception: 
         return None, None
 
-# ================= 3. 通道震荡算法 (本次新增核心) =================
+# ================= 3. 通道震荡与双通道嵌套算法 =================
 def detect_regression_channel(df, period=60, direction='下降通道', require_bottom=True):
-    """
-    通过线性回归识别规律性的通道震荡形态
-    """
-    if len(df) < period:
-        return None
-        
+    if len(df) < period: return None
     df_slice = df.tail(period)
     x = np.arange(period)
     y = df_slice['收盘'].values
     
-    # 计算归一化斜率 (判断是大趋势向上还是向下)
     y_norm = y / y[0]
     slope_norm, _ = np.polyfit(x, y_norm, 1)
     
     if direction == '下降通道' and slope_norm > -0.002: return None
     if direction == '上升通道' and slope_norm < 0.002: return None
     
-    # 真实线性回归画出通道中轴线
     slope, intercept = np.polyfit(x, y, 1)
     reg_line = slope * x + intercept
-    
-    # 用1.5倍标准差画出通道上下轨
     std_dev = np.std(y - reg_line)
     upper_band = reg_line + 1.5 * std_dev
     lower_band = reg_line - 1.5 * std_dev
     
     highs = df_slice['最高'].values
     lows = df_slice['最低'].values
-    
-    # 统计触碰次数 (留有1.5%的容错空间)
     upper_touches = np.sum(highs >= upper_band * 0.985)
     lower_touches = np.sum(lows <= lower_band * 1.015)
     
-    # 规律要求：必须是老手，至少碰过2次上轨和2次下轨
-    if upper_touches < 2 or lower_touches < 2:
-        return None
+    if upper_touches < 2 or lower_touches < 2: return None
         
-    # 通道宽度必须足够（上下轨空间大于10%），否则波段没肉吃
     channel_width = (upper_band[-1] - lower_band[-1]) / lower_band[-1] * 100
-    if channel_width < 10:
-        return None
+    if channel_width < 10: return None
         
-    # 买点判定：目前价格必须跌到了下轨附近 (3%以内)
     current_close = y[-1]
     dist_to_lower = (current_close - lower_band[-1]) / lower_band[-1] * 100
     
-    if require_bottom and (dist_to_lower > 3.0 or dist_to_lower < -2.0):
-        return None
+    if require_bottom and (dist_to_lower > 3.0 or dist_to_lower < -2.0): return None
         
     return {
         "通道方向": "↘️ 下降震荡" if slope_norm < 0 else "↗️ 上升震荡",
@@ -136,7 +119,58 @@ def detect_regression_channel(df, period=60, direction='下降通道', require_b
         "距下轨(买点)": f"{dist_to_lower:.2f}%"
     }
 
-# ================= 4. 旧版指标计算保留 (不修改原有逻辑) =================
+def detect_dual_channel(df, macro_p=180, micro_p=100, direction='下降通道'):
+    """
+    【升级算法】双通道嵌套猎手：适应更广阔的时间窗口
+    """
+    if len(df) < macro_p: return None
+    if micro_p >= macro_p: return None # 逻辑保护：小通道周期必须小于大通道
+    
+    # === 1. 拟合大通道 (Macro) ===
+    df_mac = df.tail(macro_p)
+    x_mac = np.arange(macro_p)
+    y_mac = df_mac['收盘'].values
+    slope_mac, int_mac = np.polyfit(x_mac, y_mac, 1)
+    
+    slope_mac_norm = slope_mac / y_mac[0]
+    if direction == '下降通道' and slope_mac_norm > -0.001: return None
+    if direction == '上升通道' and slope_mac_norm < 0.001: return None
+    
+    reg_mac = slope_mac * x_mac + int_mac
+    std_mac = np.std(y_mac - reg_mac)
+    lower_mac = reg_mac - 1.5 * std_mac  # 大通道下轨
+    
+    # === 2. 拟合小通道 (Micro) ===
+    df_mic = df.tail(micro_p)
+    x_mic = np.arange(micro_p)
+    y_mic = df_mic['收盘'].values
+    slope_mic, int_mic = np.polyfit(x_mic, y_mic, 1)
+    
+    reg_mic = slope_mic * x_mic + int_mic
+    std_mic = np.std(y_mic - reg_mic)
+    lower_mic = reg_mic - 1.5 * std_mic  # 小通道下轨
+    
+    current_close = y_mac[-1]
+    
+    # === 3. 破底翻判定 ===
+    dist_to_mic_lower = (current_close - lower_mic[-1]) / lower_mic[-1] * 100
+    is_micro_broken = dist_to_mic_lower < 1.0  # 距离小下轨很近或已跌破
+    
+    dist_to_mac_lower = (current_close - lower_mac[-1]) / lower_mac[-1] * 100
+    # 放宽大通道底部的容错率（-3% 到 4%）
+    is_macro_supported = -3.0 <= dist_to_mac_lower <= 4.0 
+    
+    if is_micro_broken and is_macro_supported:
+        return {
+            "形态": "🪆双通道诱空(破底翻)",
+            "大通道方向": "↘️ 下降" if slope_mac_norm < 0 else "↗️ 上升",
+            "当前价": round(current_close, 2),
+            "距大下轨(支撑)": f"{dist_to_mac_lower:.2f}%",
+            "距小下轨(破位)": f"{dist_to_mic_lower:.2f}% (诱空)"
+        }
+    return None
+
+# ================= 4. 旧版指标计算保留 =================
 def find_best_ma(df):
     best_ma = 0
     best_score = -9999
@@ -256,7 +290,6 @@ if not db_ready:
     st.error("云端存储环境初始化失败，请稍后刷新重试。")
     st.stop()
 
-# 【全新结构】：增加 Tab 5 专为规律通道服务
 tabs = st.tabs(["🏗️ 基因基建", "⚡ 实盘扫描", "⏳ 时光机回测", "🏆 归因提炼", "📈 规律通道猎手"])
 
 # ----------------- Tab 1: 基因基建 -----------------
@@ -264,13 +297,11 @@ with tabs[0]:
     st.markdown("### 全市场基建与灵魂均线计算")
     if st.button("开始全市场基建"):
         pool = [f"{p}{i:03d}" for p in ['600','601','603','605','000','001','002'] for i in range(1000)]
-        
         try:
             conn = sqlite3.connect(DB_NAME, timeout=15)
             existing = pd.read_sql("SELECT code FROM stock_genes", conn)['code'].astype(str).tolist()
             conn.close()
-        except:
-            existing = []
+        except: existing = []
             
         todo = [c for c in pool if c not in existing]
         bar = st.progress(0.0)
@@ -310,12 +341,9 @@ with tabs[1]:
     ], horizontal=True)
     
     col1, col2, col3 = st.columns(3)
-    with col1:
-        max_vol = st.slider("最大年化波动率阈值", 0.1, 1.0, 0.4, 0.05)
-    with col2:
-        min_mom = st.slider("最低相对大盘动量 (%)", -5.0, 20.0, 5.0, 1.0)
-    with col3:
-        vol_m = st.slider("突破时成交量放大倍数", 1.0, 3.0, 1.5)
+    with col1: max_vol = st.slider("最大年化波动率阈值", 0.1, 1.0, 0.4, 0.05)
+    with col2: min_mom = st.slider("最低相对大盘动量 (%)", -5.0, 20.0, 5.0, 1.0)
+    with col3: vol_m = st.slider("突破时成交量放大倍数", 1.0, 3.0, 1.5)
         
     st.markdown("---")
     reject_knife = st.checkbox("🛡️ 严禁接飞刀：自动过滤断崖暴跌股与中期下降通道(MA60向下)", value=True)
@@ -361,12 +389,8 @@ with tabs[1]:
                 
                 if is_gap_up and is_solid_green and is_vol_surge and is_uptrend:
                     return {
-                        "代码": row['code'], 
-                        "名称": row['name'], 
-                        "形态标签": "💥 N字起爆+向上缺口", 
-                        "当前价": round(C.iloc[-1], 2), 
-                        "跳空幅度": f"{gap_pct:.2f}%", 
-                        "量比": f"{(V.iloc[-1]/v_avg.iloc[-1]):.2f}x"
+                        "代码": row['code'], "名称": row['name'], "形态标签": "💥 N字起爆+向上缺口", 
+                        "当前价": round(C.iloc[-1], 2), "跳空幅度": f"{gap_pct:.2f}%", "量比": f"{(V.iloc[-1]/v_avg.iloc[-1]):.2f}x"
                     }
                     
             else: 
@@ -432,17 +456,14 @@ with tabs[2]:
             
             ma20_slope_matrix = (ma20 - ma20.shift(10)) / ma20.shift(10)
             is_falling_knife_matrix = (ma20_slope_matrix < -0.02)
-            
             ma60_slope_matrix = (ma60 - ma60.shift(20)) / ma60.shift(20)
             is_macro_downtrend_matrix = (ma60_slope_matrix < -0.01) & (C < ma60)
-            
             reject_mask = is_falling_knife_matrix | is_macro_downtrend_matrix
             
             std20 = C.rolling(20).std()
             bbw = (4 * std20) / ma20
             bbw_min_120 = bbw.rolling(120).min()
             bbw_max_120 = bbw.rolling(120).max()
-            
             sqz_score_matrix = ((bbw - bbw_min_120) / (bbw_max_120 - bbw_min_120 + 1e-9)) * 100
             squeeze_on = (sqz_score_matrix <= 0.15)
             
@@ -460,7 +481,6 @@ with tabs[2]:
             double_cross_matrix = macd_cross & roc_cross
             
             price_stable = C > (C.shift(3) * 0.96)
-            
             v_ma3 = V.rolling(3).mean()
             v_ma20 = V.rolling(20).mean()
             vol_ratio_matrix = V / v_ma20
@@ -490,12 +510,9 @@ with tabs[2]:
             uptrend_matrix = C > ma20
             gap_signal = gap_up_matrix & solid_yang_matrix & gap_vol_surge_matrix & uptrend_matrix
             
-            if "三维" in backtest_strategy:
-                target_signal = right_signal
-            elif "跳空" in backtest_strategy:
-                target_signal = gap_signal
-            else:
-                target_signal = left_signal
+            if "三维" in backtest_strategy: target_signal = right_signal
+            elif "跳空" in backtest_strategy: target_signal = gap_signal
+            else: target_signal = left_signal
             
             triggers = []
             start_idx = max(260, len(df_calc) - lookback_days)
@@ -517,12 +534,9 @@ with tabs[2]:
                         else: fwd_ret[f'Hold_{h}D'] = np.nan
                             
                     triggers.append({
-                        "代码": row['code'], "名称": name, "形态": tag,
-                        "触发日期": trigger_date, "触发价": round(trigger_price, 2),
-                        "起爆_Squeeze评分": round(sqz_score_matrix.iloc[i], 2),
-                        "起爆_ROC": round(roc12.iloc[i], 2),
-                        "起爆_量比": round(vol_ratio_matrix.iloc[i], 2),
-                        "起爆_年线乖离(%)": round(dist_ma250_matrix.iloc[i], 2) if pd.notna(dist_ma250_matrix.iloc[i]) else 999,
+                        "代码": row['code'], "名称": name, "形态": tag, "触发日期": trigger_date, "触发价": round(trigger_price, 2),
+                        "起爆_Squeeze评分": round(sqz_score_matrix.iloc[i], 2), "起爆_ROC": round(roc12.iloc[i], 2),
+                        "起爆_量比": round(vol_ratio_matrix.iloc[i], 2), "起爆_年线乖离(%)": round(dist_ma250_matrix.iloc[i], 2) if pd.notna(dist_ma250_matrix.iloc[i]) else 999,
                         **fwd_ret
                     })
             return triggers
@@ -548,14 +562,11 @@ with tabs[2]:
 
 # ----------------- Tab 4: 归因分析提炼 -----------------
 with tabs[3]:
-    st.markdown("### 🏆 数据归因与提炼 (专为喂给大模型设计)")
-    
+    st.markdown("### 🏆 数据归因与提炼")
     uploaded_file = st.file_uploader("📂 上传 [时光机_特征样本.csv]", type=['csv'])
-    
     if uploaded_file is not None:
         try:
             res_df = pd.read_csv(uploaded_file)
-            
             hold_cols = [col for col in res_df.columns if 'Hold_' in col]
             clean_df = res_df.copy()
             for col in hold_cols:
@@ -567,35 +578,40 @@ with tabs[3]:
             if '起爆_Squeeze评分' in clean_df.columns:
                 winners = clean_df[clean_df['最大涨幅'] >= 10.0]  
                 losers = clean_df[(clean_df['最大跌幅'] <= -5.0) & (clean_df['最大涨幅'] < 5.0)]  
-                
                 col_w, col_l = st.columns(2)
                 with col_w:
                     st.success(f"🏆 成功组 (最大涨幅>10%): 共 {len(winners)} 只")
-                    if not winners.empty:
-                        st.dataframe(winners[['名称', '触发日期', '起爆_Squeeze评分', '起爆_ROC', '最大涨幅']])
+                    if not winners.empty: st.dataframe(winners[['名称', '触发日期', '起爆_Squeeze评分', '起爆_ROC', '最大涨幅']])
                 with col_l:
                     st.error(f"☠️ 失败组 (最大跌幅<-5%且未曾大涨): 共 {len(losers)} 只")
-                    if not losers.empty:
-                        st.dataframe(losers[['名称', '触发日期', '起爆_Squeeze评分', '起爆_ROC', '最大跌幅']])
-            else:
-                st.error("您上传的 CSV 不包含起爆特征。")
-        except Exception as e:
-            st.error(f"分析失败: {e}")
+                    if not losers.empty: st.dataframe(losers[['名称', '触发日期', '起爆_Squeeze评分', '起爆_ROC', '最大跌幅']])
+            else: st.error("您上传的 CSV 不包含起爆特征。")
+        except Exception as e: st.error(f"分析失败: {e}")
 
-# ----------------- Tab 5: 规律通道猎手 (本次专属新增) -----------------
+# ----------------- Tab 5: 规律通道猎手 (滑块参数扩容版) -----------------
 with tabs[4]:
-    st.markdown("### 📈 规律通道挖掘 (高抛低吸神器)")
-    st.markdown("专供波段玩家！通过**线性回归 (Linear Regression)**算法，找出那些在通道内规规矩矩震荡的股票，并且筛选出目前价格刚好跌到**通道下轨（买点）**的绝佳标的。")
+    st.markdown("### 📈 规律通道挖掘 (单边波段 & 破底翻反转)")
+    
+    scan_mode = st.radio("选择通道挖掘模式:", [
+        "1. 标准单通道 (规律震荡的高抛低吸)", 
+        "2. 🪆 双通道嵌套 (跌破小通道引发恐慌 + 踩中大通道提供支撑)"
+    ], horizontal=True)
+    
+    st.markdown("---")
     
     col_c1, col_c2, col_c3 = st.columns(3)
-    with col_c1:
-        channel_dir = st.selectbox("选择要寻找的通道方向:", ["下降通道", "上升通道"])
-    with col_c2:
-        channel_period = st.slider("通道形成周期 (天)", 30, 120, 60, 10)
-    with col_c3:
-        only_bottom = st.checkbox("🎯 仅显示刚跌到通道下轨附近的股票", value=True)
+    if "双通道" in scan_mode:
+        with col_c1: channel_dir = st.selectbox("大通道方向:", ["下降通道", "上升通道"])
+        # 【修改重点】：大幅扩容大通道的滑块范围到 400天，默认设置到 180天
+        with col_c2: macro_p = st.slider("大通道周期 (大级别支撑, 天)", 60, 400, 180, 10)
+        # 【修改重点】：大幅扩容小通道的滑块范围到 200天，默认设置到 100天
+        with col_c3: micro_p = st.slider("小通道周期 (内部嵌套破位, 天)", 20, 200, 100, 10)
+    else:
+        with col_c1: channel_dir = st.selectbox("选择要寻找的通道方向:", ["下降通道", "上升通道"])
+        with col_c2: channel_period = st.slider("通道形成周期 (天)", 30, 250, 60, 10)
+        with col_c3: only_bottom = st.checkbox("🎯 仅显示刚跌到通道下轨附近的股票", value=True)
         
-    if st.button("🔍 开始挖掘通道规律股"):
+    if st.button("🔍 开始执行高阶通道运算"):
         conn = sqlite3.connect(DB_NAME, timeout=15)
         genes = pd.read_sql("SELECT * FROM stock_genes", conn)
         conn.close()
@@ -607,7 +623,11 @@ with tabs[4]:
         def channel_scan_task(row):
             df, name = get_data(row['code'])
             if df is not None:
-                res = detect_regression_channel(df, period=channel_period, direction=channel_dir, require_bottom=only_bottom)
+                if "双通道" in scan_mode:
+                    res = detect_dual_channel(df, macro_p=macro_p, micro_p=micro_p, direction=channel_dir)
+                else:
+                    res = detect_regression_channel(df, period=channel_period, direction=channel_dir, require_bottom=only_bottom)
+                
                 if res:
                     res["代码"] = row['code']
                     res["名称"] = name
@@ -621,16 +641,20 @@ with tabs[4]:
                 if res: c_hits.append(res)
                 if len(genes) > 0 and i % 10 == 0: 
                     c_bar.progress((i+1)/len(genes))
-                    c_status.text(f"正在拟合线性回归通道... 进度: {i+1} / {len(genes)} | 🎯 发现通道股: {len(c_hits)} 个")
+                    c_status.text(f"正在进行复杂几何运算... 进度: {i+1} / {len(genes)} | 🎯 发现形态股: {len(c_hits)} 个")
                     
         c_bar.progress(1.0)
-        c_status.text(f"扫描完毕！找到 {len(c_hits)} 个符合规律震荡特征的标的。")
+        c_status.text(f"扫描完毕！找到 {len(c_hits)} 个符合绝佳几何形态的标的。")
         
         if c_hits:
             st.balloons()
-            # 调整列顺序美化显示
-            df_display = pd.DataFrame(c_hits)[["代码", "名称", "通道方向", "通道空间", "上轨触碰", "下轨触碰", "当前价", "距下轨(买点)"]]
-            st.dataframe(df_display)
-            st.info("💡 **波段操作指南**：【距下轨】的值越接近 0%，说明它此刻越贴近支撑位，买入的安全边际越高；【通道空间】代表了它未来反弹到上轨时的理论利润空间。")
+            if "双通道" in scan_mode:
+                df_display = pd.DataFrame(c_hits)[["代码", "名称", "形态", "大通道方向", "当前价", "距大下轨(支撑)", "距小下轨(破位)"]]
+                st.dataframe(df_display)
+                st.success("💡 **实战真言**：这是游资极其喜爱的【诱空破底翻】形态。小通道破位制造了散户割肉的流动性，而下方紧挨着大级别通道的支撑。买入后，止损设在大通道下轨下方2%处，盈亏比极高！")
+            else:
+                df_display = pd.DataFrame(c_hits)[["代码", "名称", "通道方向", "通道空间", "上轨触碰", "下轨触碰", "当前价", "距下轨(买点)"]]
+                st.dataframe(df_display)
+                st.info("💡 **波段操作指南**：【距下轨】的值越接近 0%，说明它此刻越贴近支撑位；【通道空间】代表了它未来反弹到上轨时的理论利润。")
         else:
-            st.warning("当前市场没找到符合这种规律震荡的股票，或者您可以尝试放宽『通道形成周期』。")
+            st.warning("当前市场没找到符合这种复杂震荡特征的股票，尝试放宽计算的周期天数。")
