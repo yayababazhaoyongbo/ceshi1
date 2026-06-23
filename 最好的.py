@@ -1,4 +1,7 @@
 import streamlit as st
+# 【修复1】页面配置必须放在所有逻辑的第一位，否则云端必卡死
+st.set_page_config(layout="wide", page_title="终极量化狙击系统", page_icon="🎯")
+
 import pandas as pd
 import numpy as np
 import requests
@@ -14,7 +17,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ================= 1. 配置中心 =================
 DB_NAME = "market_data_ultimate.db"
-THREAD_COUNT = 20  
+# 【修复2】降低并发线程数，防止 Streamlit Cloud 1GB 内存溢出导致无限重启
+THREAD_COUNT = 10  
 
 UA_LIST = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
@@ -24,16 +28,15 @@ UA_LIST = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0"
 ]
 
-thread_local = threading.local()
-
-def get_session():
-    if not hasattr(thread_local, "session"):
-        thread_local.session = requests.Session()
-        retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
-        adapter = HTTPAdapter(pool_connections=THREAD_COUNT, pool_maxsize=THREAD_COUNT, max_retries=retries)
-        thread_local.session.mount('http://', adapter)
-        thread_local.session.mount('https://', adapter)
-    return thread_local.session
+# 【修复3】使用 Streamlit 的缓存机制管理 Session，防止多线程环境下资源耗尽
+@st.cache_resource
+def get_global_session():
+    session = requests.Session()
+    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(pool_connections=THREAD_COUNT, pool_maxsize=THREAD_COUNT, max_retries=retries)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
 
 # ================= 2. 核心过滤与数据获取 =================
 def is_valid_stock(code, name):
@@ -52,14 +55,11 @@ def get_data(code):
         
     url = f"https://web.ifzq.gtimg.cn/appstock/app/newfqkline/get?param={symbol},day,,,500,qfq"
     try:
-        # 增加极其微小的休眠防封禁
         time.sleep(random.uniform(0.01, 0.05))
-        session = get_session()
+        session = get_global_session()
         headers = {"User-Agent": random.choice(UA_LIST)}
-        # 设置明确的 timeout 防卡死
-        resp = session.get(url, timeout=5, headers=headers, verify=False)
+        resp = session.get(url, timeout=6, headers=headers, verify=False)
         
-        # 增加异常判断，防止解析 JSON 时报错
         if resp.status_code != 200:
             return None, None
             
@@ -77,8 +77,7 @@ def get_data(code):
         
         df['最低'] = df['收盘'] * 0.985 
         return df, name
-    except Exception as e: 
-        # 捕获所有异常，确保遇到脏数据不会崩溃
+    except Exception: 
         return None, None
 
 # ================= 3. 灵魂均线核心算法 =================
@@ -114,7 +113,6 @@ def calculate_advanced_indicators(df, dynamic_params=None):
     v = df['成交量']
     if len(c) < 260: return False, None, None, None, False, False
     
-    # 【这里的阈值是关键，根据之前的归因报告，我把它锁死在最严苛的状态】
     target_sqz = 0.15   
     target_roc = 2.5    
     target_vol = 1.7    
@@ -184,14 +182,26 @@ def calculate_advanced_indicators(df, dynamic_params=None):
     return is_spring_loaded, roc12.iloc[-1], squeeze_score, vol_ratio, annual_support, is_double_cross
 
 # ================= 5. 基建与 UI =================
+# 【修复4】在 Streamlit 云端，初始化数据库函数必须安全，加上 timeout=15 防锁
+@st.cache_resource
 def init_db():
-    conn = sqlite3.connect(DB_NAME)
-    conn.execute('''CREATE TABLE IF NOT EXISTS stock_genes (code TEXT PRIMARY KEY, name TEXT, best_ma INTEGER)''')
-    conn.commit(); conn.close()
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=15, check_same_thread=False)
+        conn.execute('''CREATE TABLE IF NOT EXISTS stock_genes (code TEXT PRIMARY KEY, name TEXT, best_ma INTEGER)''')
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        return False
 
-init_db()
-st.set_page_config(layout="wide")
-st.title("🚀 量化狙击系统: 终极防崩溃版")
+# 确保启动时只执行一次数据库检查
+db_ready = init_db()
+
+st.title("🚀 量化狙击系统: 终极云端稳定版")
+
+if not db_ready:
+    st.error("云端存储环境初始化失败，请稍后刷新重试。")
+    st.stop()
 
 tabs = st.tabs(["🏗️ 基因基建", "⚡ 实盘扫描", "⏳ 时光机 (全量回测)", "🏆 归因分析提炼"])
 
@@ -200,9 +210,14 @@ with tabs[0]:
     st.markdown("### 全市场基建与灵魂均线计算")
     if st.button("开始全市场基建"):
         pool = [f"{p}{i:03d}" for p in ['600','601','603','605','000','001','002'] for i in range(1000)]
-        conn = sqlite3.connect(DB_NAME)
-        existing = pd.read_sql("SELECT code FROM stock_genes", conn)['code'].astype(str).tolist()
-        conn.close()
+        
+        try:
+            conn = sqlite3.connect(DB_NAME, timeout=15)
+            existing = pd.read_sql("SELECT code FROM stock_genes", conn)['code'].astype(str).tolist()
+            conn.close()
+        except:
+            existing = []
+            
         todo = [c for c in pool if c not in existing]
         bar = st.progress(0.0)
         status_text = st.empty()
@@ -225,7 +240,7 @@ with tabs[0]:
                     status_text.text(f"基建进度: {i+1} / {len(todo)} | 已完成计算: {len(results_to_insert)} 只")
         
         if results_to_insert:
-            conn = sqlite3.connect(DB_NAME)
+            conn = sqlite3.connect(DB_NAME, timeout=15)
             conn.executemany("INSERT OR REPLACE INTO stock_genes VALUES (?,?,?)", results_to_insert)
             conn.commit(); conn.close()
         bar.progress(1.0)
@@ -248,7 +263,7 @@ with tabs[1]:
     reject_knife = st.checkbox("🛡️ 严禁接飞刀：自动过滤断崖暴跌股与中期下降通道(MA60向下)", value=True)
 
     if st.button("⚡ 执行今日全市场扫描"):
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(DB_NAME, timeout=15)
         genes = pd.read_sql("SELECT * FROM stock_genes", conn)
         conn.close()
         
@@ -312,7 +327,7 @@ with tabs[2]:
     with col_t3: backtest_strategy = st.selectbox("要验证的策略内核", ["前瞻预判 (左侧)", "三维共振 (右侧)"])
     
     if st.button("🚀 启动全域时光机回测"):
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(DB_NAME, timeout=15)
         genes = pd.read_sql("SELECT * FROM stock_genes", conn)
         conn.close()
         test_bar = st.progress(0.0)
@@ -351,8 +366,6 @@ with tabs[2]:
             bbw_max_120 = bbw.rolling(120).max()
             
             sqz_score_matrix = ((bbw - bbw_min_120) / (bbw_max_120 - bbw_min_120 + 1e-9)) * 100
-            
-            # 【这里也同步应用最严苛的归因数据阈值】
             squeeze_on = (sqz_score_matrix <= 0.15)
             
             exp1 = c.ewm(span=12, adjust=False).mean()
@@ -364,8 +377,6 @@ with tabs[2]:
             macd_cross = (macd.shift(1) < signal.shift(1)) & (macd > signal)
             
             roc12 = (c.diff(12) / c.shift(12)) * 100
-            
-            # 【这里同步应用最严苛的ROC大于2.5%】
             roc_pulse = (roc12 > roc12.shift(1)) & (roc12 >= 2.5)
             roc_cross = (roc12.shift(1) < 0) & (roc12 > 0)
             double_cross_matrix = macd_cross & roc_cross
@@ -376,8 +387,6 @@ with tabs[2]:
             v_ma20 = v.rolling(20).mean()
             vol_ratio_matrix = v / v_ma20
             volume_dry_up = v_ma3.shift(1) < (v_ma20.shift(1) * 0.70)
-            
-            # 【这里同步应用最严苛的量比1.7倍】
             vol_pulse = (vol_ratio_matrix >= 1.7)
             
             ma250 = c.rolling(250).mean()
