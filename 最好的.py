@@ -16,7 +16,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 DB_NAME = "market_data_ultimate.db"
 THREAD_COUNT = 20  
 
-# 引入真实浏览器 UA 池，实现“幽灵”伪装，彻底防封禁
 UA_LIST = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -106,11 +105,9 @@ def calculate_advanced_indicators(df, dynamic_params=None):
     v = df['成交量']
     if len(c) < 260: return False, None, None, None, False, False
     
-    # 继承上一版的严苛特征
     target_sqz = 0.15   
     target_roc = 2.5    
     target_vol = 1.7    
-    # 【新增防飞刀参数】：是否启用斜率保护
     reject_downtrend = True
     
     if dynamic_params:
@@ -120,11 +117,18 @@ def calculate_advanced_indicators(df, dynamic_params=None):
         reject_downtrend = dynamic_params.get("reject_downtrend", True)
     
     ma20 = c.rolling(20).mean()
+    ma60 = c.rolling(60).mean()
     
-    # 【重磅修复：趋势斜率锁】
-    # 计算20日均线过去3天的倾斜度。如果还在快速杀跌，说明是下跌中继，直接一票否决！
-    ma20_slope = (ma20.iloc[-1] - ma20.iloc[-4]) / ma20.iloc[-4]
-    is_falling_knife = (ma20_slope < -0.015) # 3天内20日线向下俯冲超过1.5%视为飞刀
+    # 【终极修正 1：防断崖式飞刀】
+    # 扩大监控周期，如果过去10天MA20跌幅超过2%，视为正在加速暴跌
+    ma20_slope_10d = (ma20.iloc[-1] - ma20.iloc[-10]) / ma20.iloc[-10] if pd.notna(ma20.iloc[-10]) else 0
+    is_falling_knife = (ma20_slope_10d < -0.02)
+    
+    # 【终极修正 2：防阴跌下降通道 (解决您的截图问题)】
+    # 看过去20天(一个月)的MA60斜率。如果不仅被MA60压制，且MA60整体在下滑，说明是下降通道。
+    ma60_slope_20d = (ma60.iloc[-1] - ma60.iloc[-20]) / ma60.iloc[-20] if pd.notna(ma60.iloc[-20]) else 0
+    price_suppressed_by_60 = c.iloc[-1] < ma60.iloc[-1]
+    is_macro_downtrend = (ma60_slope_20d < -0.01) and price_suppressed_by_60
     
     std20 = c.rolling(20).std()
     bbw = (4 * std20) / ma20
@@ -166,8 +170,8 @@ def calculate_advanced_indicators(df, dynamic_params=None):
         if (recent_low >= ma250.iloc[-1] * 0.98) and (recent_low <= ma250.iloc[-1] * 1.05) and (c.iloc[-1] > ma250.iloc[-1]):
             annual_support = True
             
-    # 【增加飞刀过滤】：如果开启了规避主跌浪，且正在自由落体，则强制否决
-    if reject_downtrend and is_falling_knife:
+    # 【双重封锁】：不仅防飞刀，也防下降通道
+    if reject_downtrend and (is_falling_knife or is_macro_downtrend):
         is_spring_loaded = False
     else:
         is_spring_loaded = squeeze_on and momentum_pulse and roc_pulse and price_stable and (volume_dry_up or vol_pulse)
@@ -182,7 +186,7 @@ def init_db():
 
 init_db()
 st.set_page_config(layout="wide")
-st.title("🚀 量化狙击系统: 趋势斜率护城河版")
+st.title("🚀 量化狙击系统: 终极下降通道阻断版")
 
 tabs = st.tabs(["🏗️ 基因基建", "⚡ 实盘扫描", "⏳ 时光机 (全量回测)", "🏆 归因分析提炼"])
 
@@ -236,8 +240,7 @@ with tabs[1]:
         vol_m = st.slider("突破时成交量放大倍数", 1.0, 3.0, 1.5)
         
     st.markdown("---")
-    # 【UI新增】：给用户规避主跌浪的选择权
-    reject_knife = st.checkbox("🛡️ 规避下降通道 (要求近期20日均线斜率不得向下俯冲)", value=True)
+    reject_knife = st.checkbox("🛡️ 严禁接飞刀：自动过滤断崖暴跌股与中期下降通道(MA60向下)", value=True)
 
     if st.button("⚡ 执行今日全市场扫描"):
         conn = sqlite3.connect(DB_NAME)
@@ -294,12 +297,206 @@ with tabs[1]:
         if hits: st.dataframe(pd.DataFrame(hits))
         else: st.warning("当前市场暂无完全符合该策略的标的。")
 
-# ----------------- Tab 3 & Tab 4 维持上一版状态 -----------------
-# ... (为精简上下文，后续Tab保持原逻辑即可，它们也会自动继承这个斜率防坠落判定)
+# ----------------- Tab 3: 时光机与特征快照 -----------------
 with tabs[2]:
     st.markdown("### ⏳ 时光机：历史扫描与全量特征捕捉")
-    # ... 省略重复内容，功能不变
     
+    col_t1, col_t2, col_t3 = st.columns(3)
+    with col_t1: lookback_days = st.number_input("扫描过去多少天？", min_value=5, max_value=100, value=30, step=5)
+    with col_t2: max_hold = st.number_input("验证未来几天收益？", min_value=3, max_value=30, value=10, step=1)
+    with col_t3: backtest_strategy = st.selectbox("要验证的策略内核", ["前瞻预判 (左侧)", "三维共振 (右侧)"])
+    
+    if st.button("🚀 启动全域时光机回测"):
+        conn = sqlite3.connect(DB_NAME)
+        genes = pd.read_sql("SELECT * FROM stock_genes", conn)
+        conn.close()
+        test_bar = st.progress(0.0)
+        status_text = st.empty()
+        index_df_full, _ = get_data('000001')
+        hits = []
+        
+        def vectorized_backtest_task(row):
+            df, name = get_data(row['code'])
+            if df is None or len(df) < 260: return []
+            
+            df_calc = df.copy()
+            if index_df_full is not None:
+                df_calc = pd.merge(df_calc, index_df_full[['日期', '收盘']], on='日期', how='left', suffixes=('', '_idx'))
+                idx_c = df_calc['收盘_idx'].ffill() 
+                idx_ret_20 = idx_c.pct_change(20)
+            else: idx_ret_20 = 0
+                
+            c = df_calc['收盘']
+            v = df_calc['成交量']
+            
+            ma20 = c.rolling(20).mean()
+            ma60 = c.rolling(60).mean()
+            
+            # 【同步修复时光机的矩阵运算：下降通道封锁网】
+            ma20_slope_matrix = (ma20 - ma20.shift(10)) / ma20.shift(10)
+            is_falling_knife_matrix = (ma20_slope_matrix < -0.02)
+            
+            ma60_slope_matrix = (ma60 - ma60.shift(20)) / ma60.shift(20)
+            is_macro_downtrend_matrix = (ma60_slope_matrix < -0.01) & (c < ma60)
+            
+            # 把两把刀合并成一个过滤面具
+            reject_mask = is_falling_knife_matrix | is_macro_downtrend_matrix
+            
+            std20 = c.rolling(20).std()
+            bbw = (4 * std20) / ma20
+            bbw_min_120 = bbw.rolling(120).min()
+            bbw_max_120 = bbw.rolling(120).max()
+            
+            sqz_score_matrix = ((bbw - bbw_min_120) / (bbw_max_120 - bbw_min_120 + 1e-9)) * 100
+            squeeze_on = bbw <= (bbw_min_120 * 1.05)
+            
+            exp1 = c.ewm(span=12, adjust=False).mean()
+            exp2 = c.ewm(span=26, adjust=False).mean()
+            macd = exp1 - exp2
+            signal = macd.ewm(span=9, adjust=False).mean()
+            hist = macd - signal
+            momentum_pulse = hist > hist.shift(1)
+            macd_cross = (macd.shift(1) < signal.shift(1)) & (macd > signal)
+            
+            roc12 = (c.diff(12) / c.shift(12)) * 100
+            roc_pulse = roc12 > roc12.shift(1)
+            roc_cross = (roc12.shift(1) < 0) & (roc12 > 0)
+            double_cross_matrix = macd_cross & roc_cross
+            
+            price_stable = c > (c.shift(3) * 0.96)
+            
+            v_ma3 = v.rolling(3).mean()
+            v_ma20 = v.rolling(20).mean()
+            vol_ratio_matrix = v / v_ma20
+            volume_dry_up = v_ma3.shift(1) < (v_ma20.shift(1) * 0.70)
+            vol_pulse = v > (v_ma3.shift(1) * 1.5)
+            
+            ma250 = c.rolling(250).mean()
+            dist_ma250_matrix = (c - ma250) / ma250 * 100 
+            recent_low = c.rolling(5).min() * 0.985
+            annual_touch = (recent_low >= ma250 * 0.98) & (recent_low <= ma250 * 1.05) & (c > ma250)
+            
+            # 加入 (~reject_mask) 取反，彻底拦截下降通道标的
+            left_signal = squeeze_on & momentum_pulse & roc_pulse & price_stable & (volume_dry_up | vol_pulse) & (~reject_mask)
+            
+            vol_array = c.pct_change().rolling(60).std() * np.sqrt(252)
+            mom_array = c.pct_change(20) - idx_ret_20
+            best_ma = row['best_ma'] if pd.notna(row['best_ma']) else 60
+            ema = c.ewm(span=best_ma, adjust=False).mean()
+            cross_up = (c > ema) & (c.shift(1) <= ema.shift(1))
+            v_avg = v.shift(1).rolling(20).mean()
+            vol_break = v > (v_avg * 1.5)
+            right_signal = (vol_array <= 0.4) & (mom_array * 100 >= 5) & cross_up & vol_break
+            
+            target_signal = right_signal if "三维" in backtest_strategy else left_signal
+            
+            triggers = []
+            start_idx = max(260, len(df_calc) - lookback_days)
+            for i in range(start_idx, len(df_calc)):
+                if target_signal.iloc[i]:
+                    trigger_date = df_calc['日期'].iloc[i]
+                    trigger_price = c.iloc[i]
+                    
+                    tag = "🔴极致压缩" if "前瞻" in backtest_strategy else "🟢三维突破"
+                    if annual_touch.iloc[i]: tag += "+🐉年线"
+                    if double_cross_matrix.iloc[i]: tag += "+🌟双金叉"
+                    
+                    fwd_ret = {}
+                    for h in range(1, max_hold + 1):
+                        if i + h < len(df_calc): fwd_ret[f'Hold_{h}D'] = (c.iloc[i+h] - trigger_price) / trigger_price * 100
+                        else: fwd_ret[f'Hold_{h}D'] = np.nan
+                            
+                    triggers.append({
+                        "代码": row['code'], "名称": name, "形态": tag,
+                        "触发日期": trigger_date, "触发价": round(trigger_price, 2),
+                        "起爆_Squeeze评分": round(sqz_score_matrix.iloc[i], 2),
+                        "起爆_ROC": round(roc12.iloc[i], 2),
+                        "起爆_量比": round(vol_ratio_matrix.iloc[i], 2),
+                        "起爆_年线乖离(%)": round(dist_ma250_matrix.iloc[i], 2) if pd.notna(dist_ma250_matrix.iloc[i]) else 999,
+                        **fwd_ret
+                    })
+            return triggers
+
+        with ThreadPoolExecutor(max_workers=THREAD_COUNT) as ex:
+            futs = [ex.submit(vectorized_backtest_task, r) for _, r in genes.iterrows()]
+            for i, f in enumerate(as_completed(futs)):
+                res = f.result()
+                if res: hits.extend(res)
+                if len(genes) > 0 and i % 10 == 0: 
+                    test_bar.progress((i+1)/len(genes))
+                    status_text.text(f"时光机采集样本中... 进度: {i+1} / {len(genes)} | 🎯 收集信号: {len(hits)} 个")
+                    
+        test_bar.progress(1.0)
+        status_text.text(f"回测完毕。生成 {len(hits)} 份历史样本。请下载 CSV 去 Tab 4 归因分析！")
+        if hits:
+            res_df = pd.DataFrame(hits)
+            csv_data = res_df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(label="📥 导出回测 CSV 数据包", data=csv_data, file_name="时光机_特征样本.csv", mime="text/csv")
+            st.dataframe(res_df.sort_values(by="触发日期", ascending=False))
+            st.balloons()
+        else: st.info("该区间内无股票触发策略。")
+
+# ----------------- Tab 4: 归因分析提炼 (人机协作核心) -----------------
 with tabs[3]:
     st.markdown("### 🏆 数据归因与提炼 (专为喂给大模型设计)")
-    # ... 省略重复内容，功能不变
+    
+    uploaded_file = st.file_uploader("📂 上传 [时光机_特征样本.csv]", type=['csv'])
+    
+    if uploaded_file is not None:
+        try:
+            res_df = pd.read_csv(uploaded_file)
+            
+            hold_cols = [col for col in res_df.columns if 'Hold_' in col]
+            clean_df = res_df.copy()
+            for col in hold_cols:
+                clean_df[col] = clean_df[col].astype(str).str.replace('%', '', regex=False).str.replace('+', '', regex=False).replace('等待开奖', np.nan).replace('nan', np.nan).astype(float)
+            
+            clean_df['最大涨幅'] = clean_df[hold_cols].max(axis=1)
+            clean_df['最大跌幅'] = clean_df[hold_cols].min(axis=1)
+            
+            if '起爆_Squeeze评分' in clean_df.columns:
+                winners = clean_df[clean_df['最大涨幅'] >= 10.0]  
+                losers = clean_df[(clean_df['最大跌幅'] <= -5.0) & (clean_df['最大涨幅'] < 5.0)]  
+                
+                col_w, col_l = st.columns(2)
+                with col_w:
+                    st.success(f"🏆 成功组 (最大涨幅>10%): 共 {len(winners)} 只")
+                    if not winners.empty:
+                        st.dataframe(winners[['名称', '触发日期', '起爆_Squeeze评分', '起爆_ROC', '最大涨幅']])
+                with col_l:
+                    st.error(f"☠️ 失败组 (最大跌幅<-5%且未曾大涨): 共 {len(losers)} 只")
+                    if not losers.empty:
+                        st.dataframe(losers[['名称', '触发日期', '起爆_Squeeze评分', '起爆_ROC', '最大跌幅']])
+                
+                st.divider()
+                st.markdown("#### 🤖 专属 AI 沟通报告")
+                
+                win_sqz = winners['起爆_Squeeze评分'].median() if not winners.empty else 0
+                win_roc = winners['起爆_ROC'].median() if not winners.empty else 0
+                win_vol = winners['起爆_量比'].median() if not winners.empty else 0
+                
+                lose_sqz = losers['起爆_Squeeze评分'].median() if not losers.empty else 0
+                lose_roc = losers['起爆_ROC'].median() if not losers.empty else 0
+                lose_vol = losers['起爆_量比'].median() if not losers.empty else 0
+                
+                report_text = (
+                    f"你好！我刚刚用系统对历史进行了回测归因，得到了以下量化特征对比数据，请帮我分析并修改Python代码的过滤参数：\n\n"
+                    f"【成功起爆的股票特征 (涨幅>10%)】\n"
+                    f"- 启动前布林带压缩评分中位数：{win_sqz:.2f}分\n"
+                    f"- 启动前 ROC(12) 动量中位数：{win_roc:.2f}%\n"
+                    f"- 启动当量比中位数：{win_vol:.2f}x\n\n"
+                    f"【失败被套的股票特征 (跌幅>-5%且未涨)】\n"
+                    f"- 启动前布林带压缩评分中位数：{lose_sqz:.2f}分\n"
+                    f"- 启动前 ROC(12) 动量中位数：{lose_roc:.2f}%\n"
+                    f"- 启动当量比中位数：{lose_vol:.2f}x\n\n"
+                    f"我的诉求：\n"
+                    f"1. 请根据上述数据对比，帮我找出成功组和失败组最明显的区分点。\n"
+                    f"2. 请帮我给出更严格的代码替换方案，以便滤除那些失败组特征的杂鱼股票。"
+                )
+                
+                st.text_area("📋 报告内容 (请复制发送给AI)：", value=report_text, height=350)
+                
+            else:
+                st.error("您上传的 CSV 不包含起爆特征。请去 Tab 3 跑一次最新的时光机并下载 CSV！")
+        except Exception as e:
+            st.error(f"分析失败: {e}")
