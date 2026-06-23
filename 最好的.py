@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 DB_NAME = "market_data_ultimate.db"
 THREAD_COUNT = 20  
 
-# 【融合进化 1】：从 111.py 引入真实浏览器 UA 池，实现“幽灵”伪装，彻底防封禁
+# 引入真实浏览器 UA 池，实现“幽灵”伪装，彻底防封禁
 UA_LIST = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -55,7 +55,6 @@ def get_data(code):
     try:
         time.sleep(random.uniform(0.01, 0.05))
         session = get_session()
-        # 每次请求随机抽取一个浏览器身份
         headers = {"User-Agent": random.choice(UA_LIST)}
         resp = session.get(url, timeout=5, headers=headers, verify=False)
         data = resp.json()['data'][symbol]
@@ -102,19 +101,10 @@ def calculate_momentum(stock_df, index_df, period=20):
         return stock_return - index_return
     except: return 0
 
-def calculate_advanced_indicators(df, dynamic_params=None):
+def calculate_advanced_indicators(df):
     c = df['收盘']
     v = df['成交量']
     if len(c) < 260: return False, None, None, None, False, False
-    
-    target_sqz = 100.0
-    target_roc = -99.0
-    target_vol = 1.5
-    
-    if dynamic_params:
-        target_sqz = dynamic_params.get("max_sqz", 100.0)
-        target_roc = dynamic_params.get("min_roc", -99.0)
-        target_vol = dynamic_params.get("min_vol", 1.5)
     
     ma20 = c.rolling(20).mean()
     std20 = c.rolling(20).std()
@@ -123,13 +113,13 @@ def calculate_advanced_indicators(df, dynamic_params=None):
     bbw_max_120 = bbw.rolling(120).max()
     
     squeeze_score = ((bbw.iloc[-1] - bbw_min_120.iloc[-1]) / (bbw_max_120.iloc[-1] - bbw_min_120.iloc[-1] + 1e-9)) * 100
-    squeeze_on = squeeze_score <= target_sqz if dynamic_params else (bbw.iloc[-1] <= bbw_min_120.iloc[-1] * 1.05)
+    squeeze_on = (bbw.iloc[-1] <= bbw_min_120.iloc[-1] * 1.05)
     
     v_ma3 = v.rolling(3).mean()
     v_ma20 = v.rolling(20).mean()
     volume_dry_up = v_ma3.iloc[-2] < (v_ma20.iloc[-2] * 0.70)
     vol_ratio = v.iloc[-1] / v_ma20.iloc[-1]
-    vol_pulse = vol_ratio > target_vol if dynamic_params else (v.iloc[-1] > v_ma3.iloc[-2] * 1.5)
+    vol_pulse = (v.iloc[-1] > v_ma3.iloc[-2] * 1.5)
     
     exp1 = c.ewm(span=12, adjust=False).mean()
     exp2 = c.ewm(span=26, adjust=False).mean()
@@ -138,7 +128,6 @@ def calculate_advanced_indicators(df, dynamic_params=None):
     hist = macd - signal
     momentum_pulse = hist.iloc[-1] > hist.iloc[-2]
     
-    # 【融合进化 2】：严苛的双金叉判定，提取强反转特征
     macd_cross = (macd.iloc[-2] < signal.iloc[-2]) and (macd.iloc[-1] > signal.iloc[-1])
     
     roc12 = (c.diff(12) / c.shift(12)) * 100
@@ -146,10 +135,6 @@ def calculate_advanced_indicators(df, dynamic_params=None):
     roc_cross = (roc12.iloc[-2] < 0) and (roc12.iloc[-1] > 0)
     
     is_double_cross = macd_cross and roc_cross
-    
-    if dynamic_params and roc12.iloc[-1] < target_roc:
-        roc_pulse = False
-    
     price_stable = c.iloc[-1] > c.iloc[-4] * 0.96
     
     ma250 = c.rolling(250).mean()
@@ -171,9 +156,9 @@ def init_db():
 
 init_db()
 st.set_page_config(layout="wide")
-st.title("🚀 量化狙击系统: 全维融合与AI自进化 V6")
+st.title("🚀 量化狙击系统: 人机协作归因版")
 
-tabs = st.tabs(["🏗️ 基因基建", "⚡ 实盘扫描 (今日打猎)", "⏳ 时光机 (极速回测)", "🧠 AI策略自进化与归因"])
+tabs = st.tabs(["🏗️ 基因基建", "⚡ 实盘扫描", "⏳ 时光机 (全量回测)", "🏆 归因分析提炼"])
 
 # ----------------- Tab 1: 基因基建 -----------------
 with tabs[0]:
@@ -214,7 +199,7 @@ with tabs[0]:
 # ----------------- Tab 2: 实盘扫描 -----------------
 with tabs[1]:
     st.markdown("### 今日实时策略扫描")
-    strategy_choice = st.radio("选择狙击策略:", ["三维共振 (低波+动量+均线突破)", "前瞻预判 (极限压缩+MACD+ROC)"], horizontal=True)
+    strategy_choice = st.radio("选择狙击策略:", ["三维共振 (右侧均线突破)", "前瞻预判 (左侧形态压缩)"], horizontal=True)
     
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -248,20 +233,16 @@ with tabs[1]:
                 best_ma_period = row['best_ma'] if pd.notna(row['best_ma']) else 60
                 ema_soul = c.ewm(span=best_ma_period, adjust=False).mean()
                 
-                ma250 = c.rolling(250).mean().iloc[-1]
-                annual_touch = (c.iloc[-1] >= ma250 * 0.98) and (c.iloc[-1] <= ma250 * 1.05)
-                tag = "🐉年线共振起爆" if annual_touch else "普通突破"
-                
                 if c.iloc[-1] > ema_soul.iloc[-1] and c.iloc[-2] <= ema_soul.iloc[-2]:
                     v_avg = v.shift(1).rolling(20).mean()
                     if v.iloc[-1] > v_avg.iloc[-1] * vol_m:
-                        return {"代码": row['code'], "名称": row['name'], "策略": "三维共振", "形态": tag, "当前价": round(c.iloc[-1], 2)}
+                        return {"代码": row['code'], "名称": row['name'], "策略": "三维共振", "当前价": round(c.iloc[-1], 2)}
             else:
                 is_spring, roc_val, sqz_score, vol_ratio, is_annual_bounce, is_double_cross = calculate_advanced_indicators(df)
                 if is_spring:
-                    tag = "🔴 极致压缩"
-                    if is_annual_bounce: tag += " + 🐉年线回踩 (极高胜率)"
-                    if is_double_cross: tag += " + 🌟双金叉反转"
+                    tag = "🔴极致压缩"
+                    if is_annual_bounce: tag += " + 🐉年线回踩"
+                    if is_double_cross: tag += " + 🌟双金叉"
                     return {
                         "代码": row['code'], "名称": row['name'], "形态标签": tag, 
                         "当前价": round(c.iloc[-1], 2), "ROC(12)": f"{roc_val:.2f}%", "压缩评分": f"{sqz_score:.1f}分"
@@ -282,17 +263,17 @@ with tabs[1]:
         if hits: st.dataframe(pd.DataFrame(hits))
         else: st.warning("当前市场暂无完全符合该策略的标的。")
 
-# ----------------- Tab 3: 时光机与最优持股期 -----------------
+# ----------------- Tab 3: 时光机与特征快照 -----------------
 with tabs[2]:
-    st.markdown("### ⏳ 时光机 V2：全量特征快照回测")
-    st.markdown("系统将自动捕捉每一个信号点的【原始指标特征】，为下一步的 AI 自进化提供学习样本。")
+    st.markdown("### ⏳ 时光机：历史扫描与全量特征捕捉")
+    st.markdown("一次性扫描过去 N 天触发的信号，并将起爆那一刻的指标特征（压缩分、ROC等）拍照留存，方便下一步归因。")
     
     col_t1, col_t2, col_t3 = st.columns(3)
-    with col_t1: lookback_days = st.number_input("扫描过去多少天？", min_value=5, max_value=60, value=20, step=5)
-    with col_t2: max_hold = st.number_input("验证未来几天收益？", min_value=3, max_value=20, value=10, step=1)
+    with col_t1: lookback_days = st.number_input("扫描过去多少天？", min_value=5, max_value=100, value=30, step=5)
+    with col_t2: max_hold = st.number_input("验证未来几天收益？", min_value=3, max_value=30, value=10, step=1)
     with col_t3: backtest_strategy = st.selectbox("要验证的策略内核", ["前瞻预判 (左侧)", "三维共振 (右侧)"])
     
-    if st.button("🚀 启动全域时光机收集样本"):
+    if st.button("🚀 启动全域时光机回测"):
         conn = sqlite3.connect(DB_NAME)
         genes = pd.read_sql("SELECT * FROM stock_genes", conn)
         conn.close()
@@ -397,105 +378,83 @@ with tabs[2]:
                 if res: hits.extend(res)
                 if len(genes) > 0 and i % 10 == 0: 
                     test_bar.progress((i+1)/len(genes))
-                    status_text.text(f"时光机采集特征样本中... 进度: {i+1} / {len(genes)} | 🎯 收集样本: {len(hits)} 个")
+                    status_text.text(f"时光机采集样本中... 进度: {i+1} / {len(genes)} | 🎯 收集信号: {len(hits)} 个")
                     
         test_bar.progress(1.0)
-        status_text.text(f"回测收集完毕。生成 {len(hits)} 份战斗样本。可前往 Tab 4 让 AI 归因进化。")
+        status_text.text(f"回测完毕。生成 {len(hits)} 份历史样本。请下载 CSV 去 Tab 4 归因分析！")
         if hits:
             res_df = pd.DataFrame(hits)
             csv_data = res_df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button(label="📥 导出全特征 CSV", data=csv_data, file_name="全域特征回测结果.csv", mime="text/csv")
+            st.download_button(label="📥 导出回测 CSV 数据包", data=csv_data, file_name="时光机_特征样本.csv", mime="text/csv")
             st.dataframe(res_df.sort_values(by="触发日期", ascending=False))
             st.balloons()
-        else: st.info("区间内无样本。")
+        else: st.info("该区间内无股票触发策略。")
 
-# ----------------- Tab 4: AI策略自进化 (全自动闭环引擎) -----------------
+# ----------------- Tab 4: 归因分析提炼 (人机协作核心) -----------------
 with tabs[3]:
-    st.markdown("### 🧠 AI 策略闭环引擎：从归因到进化")
-    st.markdown("上传具有特征快照的时光机 `CSV`。AI 将通过对比大涨与下杀样本，自动挖掘高胜率基因，并更新实盘拦截代码！")
+    st.markdown("### 🏆 数据归因与提炼 (专为喂给大模型设计)")
+    st.markdown("上传 Tab 3 的 CSV 文件，系统会提炼出高收益股和下跌股的核心基因差异，并生成一段**专供您复制给 AI 助手**的话术！")
     
-    uploaded_file = st.file_uploader("📂 上传附带[起爆特征]的 CSV", type=['csv'])
+    uploaded_file = st.file_uploader("📂 上传 [时光机_特征样本.csv]", type=['csv'])
     
     if uploaded_file is not None:
         try:
             res_df = pd.read_csv(uploaded_file)
             
+            # 清洗未来收益数据
             hold_cols = [col for col in res_df.columns if 'Hold_' in col]
             clean_df = res_df.copy()
             for col in hold_cols:
-                clean_df[col] = clean_df[col].astype(str).str.replace('%', '', regex=False).str.replace('+', '', regex=False).replace('等待开奖', np.nan).astype(float)
-            clean_df['最高收益'] = clean_df[hold_cols].max(axis=1)
-            clean_df['最大回撤'] = clean_df[hold_cols].min(axis=1)
+                clean_df[col] = clean_df[col].astype(str).str.replace('%', '', regex=False).str.replace('+', '', regex=False).replace('等待开奖', np.nan).replace('nan', np.nan).astype(float)
+            
+            clean_df['最大涨幅'] = clean_df[hold_cols].max(axis=1)
+            clean_df['最大跌幅'] = clean_df[hold_cols].min(axis=1)
             
             if '起爆_Squeeze评分' in clean_df.columns:
-                winners = clean_df[clean_df['最高收益'] >= 10.0]  
-                losers = clean_df[clean_df['最大回撤'] <= -5.0]  
+                # 分离大肉组和吃面组
+                winners = clean_df[clean_df['最大涨幅'] >= 10.0]  
+                losers = clean_df[(clean_df['最大跌幅'] <= -5.0) & (clean_df['最大涨幅'] < 5.0)]  
                 
-                st.markdown("#### 🔬 第一步：AI 多维特征基因测序对比")
-                win_sqz = winners['起爆_Squeeze评分'].median()
-                lose_sqz = losers['起爆_Squeeze评分'].median()
-                win_roc = winners['起爆_ROC'].median()
-                lose_roc = losers['起爆_ROC'].median()
-                win_vol = winners['起爆_量比'].median()
-                lose_vol = losers['起爆_量比'].median()
+                col_w, col_l = st.columns(2)
+                with col_w:
+                    st.success(f"🏆 成功组 (最大涨幅>10%): 共 {len(winners)} 只")
+                    if not winners.empty:
+                        st.dataframe(winners[['名称', '触发日期', '起爆_Squeeze评分', '起爆_ROC', '最大涨幅']])
+                with col_l:
+                    st.error(f"☠️ 失败组 (最大跌幅<-5%且未曾大涨): 共 {len(losers)} 只")
+                    if not losers.empty:
+                        st.dataframe(losers[['名称', '触发日期', '起爆_Squeeze评分', '起爆_ROC', '最大跌幅']])
                 
-                compare_data = {
-                    "基因特征": ["布林带压缩评分 (越低越好)", "爆发初夜动量 ROC (%)", "起爆日量比 (资金异动倍数)"],
-                    "🏆 大肉组平均特征": [f"{win_sqz:.1f}分", f"{win_roc:.2f}%", f"{win_vol:.2f}x"],
-                    "☠️ 大坑组平均特征": [f"{lose_sqz:.1f}分", f"{lose_roc:.2f}%", f"{lose_vol:.2f}x"]
-                }
-                st.dataframe(pd.DataFrame(compare_data))
+                st.divider()
+                st.markdown("#### 🤖 专属 AI 沟通报告")
+                st.write("点击输入框即可全选复制，直接发给对话框里的 AI（比如我），让我为您升级代码！")
                 
-                st.markdown("#### 🧬 第二步：AI 提炼终极进化参数")
-                evolved_sqz = win_sqz * 1.2 
-                evolved_roc = max(0, win_roc * 0.8) 
-                evolved_vol = win_vol * 0.9 
+                win_sqz = winners['起爆_Squeeze评分'].median() if not winners.empty else 0
+                win_roc = winners['起爆_ROC'].median() if not winners.empty else 0
+                win_vol = winners['起爆_量比'].median() if not winners.empty else 0
                 
-                st.info(f"**AI 分析结论：**\n那些吃大肉的标的，起爆前布林带被压缩得更变态，且动能更为充沛。\n"
-                        f"👉 **已自动生成新战法门槛：** 压缩评分必须 <= **{evolved_sqz:.1f}分**，且 ROC >= **{evolved_roc:.2f}%**，且量比 >= **{evolved_vol:.2f}x**。")
+                lose_sqz = losers['起爆_Squeeze评分'].median() if not losers.empty else 0
+                lose_roc = losers['起爆_ROC'].median() if not losers.empty else 0
+                lose_vol = losers['起爆_量比'].median() if not losers.empty else 0
                 
-                st.markdown("#### ⚔️ 第三步：用进化参数发动今日“降维打击”")
-                if st.button("🔥 接受 AI 建议：以此严苛标准扫描今日全市场！"):
-                    dynamic_params = {"max_sqz": evolved_sqz, "min_roc": evolved_roc, "min_vol": evolved_vol}
-                    
-                    conn = sqlite3.connect(DB_NAME)
-                    genes = pd.read_sql("SELECT * FROM stock_genes", conn)
-                    conn.close()
-                    evo_bar = st.progress(0.0)
-                    evo_status = st.empty()
-                    hits_evo = []
-                    
-                    def evo_scan_task(row):
-                        df, name = get_data(row['code'])
-                        if df is not None:
-                            is_spring, roc_val, sqz_score, vol_ratio, is_annual, is_double_cross = calculate_advanced_indicators(df, dynamic_params)
-                            if is_spring:
-                                tag = "🤖 AI严选·压缩起爆"
-                                if is_annual: tag += " + 🐉年线终极共振"
-                                if is_double_cross: tag += " + 🌟双金叉反转"
-                                return {
-                                    "代码": row['code'], "名称": name, "形态标签": tag,
-                                    "当前价": df['收盘'].iloc[-1], "压缩分": f"{sqz_score:.1f}", 
-                                    "ROC": f"{roc_val:.2f}%", "量比": f"{vol_ratio:.2f}x"
-                                }
-                        return None
-
-                    with ThreadPoolExecutor(max_workers=THREAD_COUNT) as ex:
-                        futs = [ex.submit(evo_scan_task, r) for _, r in genes.iterrows()]
-                        for i, f in enumerate(as_completed(futs)):
-                            res = f.result()
-                            if res: hits_evo.append(res)
-                            if len(genes) > 0 and i % 10 == 0: 
-                                evo_bar.progress((i+1)/len(genes))
-                                evo_status.text(f"执行终极猎杀... 进度: {i+1}/{len(genes)} | 发现极品: {len(hits_evo)} 个")
-                                
-                    evo_bar.progress(1.0)
-                    evo_status.text(f"AI 进化扫描完毕。万里挑一，发现 {len(hits_evo)} 个极品标的。")
-                    if hits_evo: 
-                        st.balloons()
-                        st.dataframe(pd.DataFrame(hits_evo))
-                    else: st.warning("当前市场太弱，或者 AI 参数过于严苛，暂无标的达到起爆标准。建议空仓等待！")
+                report_text = (
+                    f"你好！我刚刚用系统对历史进行了回测归因，得到了以下量化特征对比数据，请帮我分析并修改Python代码的过滤参数：\n\n"
+                    f"【成功起爆的股票特征 (涨幅>10%)】\n"
+                    f"- 启动前布林带压缩评分中位数：{win_sqz:.2f}分\n"
+                    f"- 启动前 ROC(12) 动量中位数：{win_roc:.2f}%\n"
+                    f"- 启动当量比中位数：{win_vol:.2f}x\n\n"
+                    f"【失败被套的股票特征 (跌幅>-5%且未涨)】\n"
+                    f"- 启动前布林带压缩评分中位数：{lose_sqz:.2f}分\n"
+                    f"- 启动前 ROC(12) 动量中位数：{lose_roc:.2f}%\n"
+                    f"- 启动当量比中位数：{lose_vol:.2f}x\n\n"
+                    f"我的诉求：\n"
+                    f"1. 请根据上述数据对比，帮我找出成功组和失败组最明显的区分点。\n"
+                    f"2. 请帮我给出更严格的 `calculate_advanced_indicators` 函数代码替换方案，以便实盘扫描时滤除那些失败组特征的杂鱼股票。"
+                )
+                
+                st.text_area("📋 报告内容 (请复制发送给AI)：", value=report_text, height=350)
+                
             else:
-                st.error("您上传的 CSV 是旧版本的。请到 Tab 3 重新运行一次『全域时光机』，获取带有特征快照的新文件！")
+                st.error("您上传的 CSV 不包含起爆特征。请去 Tab 3 跑一次最新的时光机并下载 CSV！")
         except Exception as e:
             st.error(f"分析失败: {e}")
