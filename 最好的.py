@@ -101,10 +101,21 @@ def calculate_momentum(stock_df, index_df, period=20):
         return stock_return - index_return
     except: return 0
 
-def calculate_advanced_indicators(df):
+def calculate_advanced_indicators(df, dynamic_params=None):
     c = df['收盘']
     v = df['成交量']
     if len(c) < 260: return False, None, None, None, False, False
+    
+    # 【基于回测大数据的严苛进化阈值】
+    # 之前是 target_sqz=100.0, target_roc=-99.0
+    target_sqz = 0.15   # 绝不妥协：压缩评分必须小于0.15，过滤掉0.43的假压缩
+    target_roc = 2.5    # 动量点火：12日动量必须达到2.5%以上，直接过滤掉0.55的软脚虾
+    target_vol = 1.7    # 异动门槛：量比提高到1.7倍及格线
+    
+    if dynamic_params:
+        target_sqz = dynamic_params.get("max_sqz", target_sqz)
+        target_roc = dynamic_params.get("min_roc", target_roc)
+        target_vol = dynamic_params.get("min_vol", target_vol)
     
     ma20 = c.rolling(20).mean()
     std20 = c.rolling(20).std()
@@ -113,13 +124,17 @@ def calculate_advanced_indicators(df):
     bbw_max_120 = bbw.rolling(120).max()
     
     squeeze_score = ((bbw.iloc[-1] - bbw_min_120.iloc[-1]) / (bbw_max_120.iloc[-1] - bbw_min_120.iloc[-1] + 1e-9)) * 100
-    squeeze_on = (bbw.iloc[-1] <= bbw_min_120.iloc[-1] * 1.05)
+    
+    # 修改判定：抛弃旧的粗略判定，直接使用严苛的压缩评分
+    squeeze_on = (squeeze_score <= target_sqz)
     
     v_ma3 = v.rolling(3).mean()
     v_ma20 = v.rolling(20).mean()
     volume_dry_up = v_ma3.iloc[-2] < (v_ma20.iloc[-2] * 0.70)
     vol_ratio = v.iloc[-1] / v_ma20.iloc[-1]
-    vol_pulse = (v.iloc[-1] > v_ma3.iloc[-2] * 1.5)
+    
+    # 放量必须超过严格阈值
+    vol_pulse = (vol_ratio >= target_vol)
     
     exp1 = c.ewm(span=12, adjust=False).mean()
     exp2 = c.ewm(span=26, adjust=False).mean()
@@ -135,6 +150,11 @@ def calculate_advanced_indicators(df):
     roc_cross = (roc12.iloc[-2] < 0) and (roc12.iloc[-1] > 0)
     
     is_double_cross = macd_cross and roc_cross
+    
+    # 【核心杀招】：强制过滤掉点火初速度达不到要求的杂鱼
+    if roc12.iloc[-1] < target_roc:
+        roc_pulse = False
+        
     price_stable = c.iloc[-1] > c.iloc[-4] * 0.96
     
     ma250 = c.rolling(250).mean()
