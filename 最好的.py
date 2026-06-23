@@ -77,10 +77,11 @@ def get_data(code):
         return None, None
 
 # ================= 3. 动态通道寻轨算法 (本次重构核心) =================
-def detect_regression_channel(df, max_period=90, direction='下降通道', require_bottom=True):
+def detect_regression_channel(df, max_period=90, direction='下降通道', require_bottom=True, min_width=30, min_touches=3, strict_close=True):
     """
     【升级版】不再死板取固定天数，而是在 max_period 范围内，
     不断动态缩小窗口，寻找最完美契合的那一条通道。
+    增加严格的空间、触碰次数、以及收盘价收敛控制。
     """
     actual_max = min(max_period, len(df))
     if actual_max < 30: return None
@@ -99,27 +100,40 @@ def detect_regression_channel(df, max_period=90, direction='下降通道', requi
         
         slope, intercept = np.polyfit(x, y, 1)
         reg_line = slope * x + intercept
+        
+        # 使用 1.8 倍标准差作为通道包络线，保证能包裹住绝大部分收盘价
         std_dev = np.std(y - reg_line)
-        upper_band = reg_line + 1.5 * std_dev
-        lower_band = reg_line - 1.5 * std_dev
+        upper_band = reg_line + 1.8 * std_dev
+        lower_band = reg_line - 1.8 * std_dev
+        
+        # 【严苛条件 3】：主力底线控制 - 收盘价严格在通道内 (容许 1% 的数学误差)
+        if strict_close:
+            closes_outside = np.sum((y > upper_band * 1.01) | (y < lower_band * 0.99))
+            if closes_outside > 0:
+                continue  # 只要有任何一天收盘价没收回通道内，直接淘汰该周期
         
         highs = df_slice['最高'].values
         lows = df_slice['最低'].values
+        
+        # 统计盘中高低点触碰甚至刺穿边界的次数 (允许刺穿，即 high >= upper_band)
         upper_touches = np.sum(highs >= upper_band * 0.985)
         lower_touches = np.sum(lows <= lower_band * 1.015)
         
-        # 规律通道硬性指标
-        if upper_touches < 2 or lower_touches < 2: continue
+        # 【严苛条件 2】：顶部或底部触碰至少 min_touches 次 (且必须是完整通道，弱势边至少2次)
+        if max(upper_touches, lower_touches) < min_touches: continue
+        if min(upper_touches, lower_touches) < 2: continue
             
         channel_width = (upper_band[-1] - lower_band[-1]) / lower_band[-1] * 100
-        if channel_width < 10: continue
+        
+        # 【严苛条件 1】：通道空间(下跌或上涨幅度)不少于 min_width %
+        if channel_width < min_width: continue
             
         current_close = y[-1]
         dist_to_lower = (current_close - lower_band[-1]) / lower_band[-1] * 100
         
         if require_bottom and (dist_to_lower > 3.0 or dist_to_lower < -2.0): continue
             
-        # 只要找到了，就直接返回，顺便记录实际形成的天数
+        # 只要找到了，就直接返回
         return {
             "通道方向": "↘️ 下降震荡" if slope_norm < 0 else "↗️ 上升震荡",
             "实际天数": f"{p}天",
@@ -628,13 +642,20 @@ with tabs[4]:
     col_c1, col_c2, col_c3 = st.columns(3)
     if "双通道" in scan_mode:
         with col_c1: channel_dir = st.selectbox("大通道方向:", ["下降通道", "上升通道"])
-        # UI 提示更新：现在代表的是【最大范围以内】
         with col_c2: max_macro_p = st.slider("大通道寻轨上限 (天以内)", 60, 400, 180, 10)
         with col_c3: max_micro_p = st.slider("小通道寻轨上限 (天以内)", 20, 200, 100, 10)
     else:
-        with col_c1: channel_dir = st.selectbox("选择要寻找的通道方向:", ["下降通道", "上升通道"])
-        with col_c2: max_channel_period = st.slider("通道寻轨上限 (天以内)", 30, 250, 90, 10)
-        with col_c3: only_bottom = st.checkbox("🎯 仅显示刚跌到通道下轨附近的股票", value=True)
+        with col_c1: 
+            channel_dir = st.selectbox("选择要寻找的通道方向:", ["下降通道", "上升通道"])
+            max_channel_period = st.slider("通道寻轨上限 (天以内)", 30, 250, 90, 10)
+        with col_c2: 
+            # 【新增】震幅与触碰次数控制面板
+            min_width = st.slider("通道最小震幅空间 (%)", 10, 60, 30, 5)
+            min_touches = st.slider("单边至少触碰次数", 2, 8, 3, 1)
+        with col_c3: 
+            only_bottom = st.checkbox("🎯 仅显示刚跌到通道下轨附近的股票", value=True)
+            # 【新增】收盘价严格约束
+            strict_close = st.checkbox("🚧 收盘价严格在通道内 (只允许盘中刺穿)", value=True)
         
     if st.button("🔍 开始执行动态寻优运算"):
         conn = sqlite3.connect(DB_NAME, timeout=15)
@@ -651,7 +672,10 @@ with tabs[4]:
                 if "双通道" in scan_mode:
                     res = detect_dual_channel(df, max_macro_p=max_macro_p, max_micro_p=max_micro_p, direction=channel_dir)
                 else:
-                    res = detect_regression_channel(df, max_period=max_channel_period, direction=channel_dir, require_bottom=only_bottom)
+                    # 【应用全新严苛参数】
+                    res = detect_regression_channel(df, max_period=max_channel_period, direction=channel_dir, 
+                                                    require_bottom=only_bottom, min_width=min_width, 
+                                                    min_touches=min_touches, strict_close=strict_close)
                 
                 if res:
                     res["代码"] = row['code']
