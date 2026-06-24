@@ -76,160 +76,151 @@ def get_data(code):
     except Exception: 
         return None, None
 
-# ================= 3. 视觉级通道平移算法 (重构：完美契合影线极点) =================
-def detect_regression_channel(df, max_period=90, direction='下降通道', require_bottom=True, min_width=30, min_touches=3, strict_close=True):
+# ================= 3. 平行双钢尺通道寻轨算法 (重构：绝对不切K线实体) =================
+def detect_regression_channel(df, max_period=90, direction='下降通道', require_bottom=True, min_width=30, min_touches=3):
+    """
+    【全新重构】双钢尺动态包裹算法
+    100% 保证上下边界线紧贴K线最外侧影线，没有任何实体或影线会被“切西瓜”斩断。
+    """
     actual_max = min(max_period, len(df))
     if actual_max < 30: return None
     
-    # 动态寻优循环：不断缩小窗口，寻找最完美契合的那一条通道
+    # 从最大周期开始动态收敛寻找
     for p in range(actual_max, 29, -5):
         df_slice = df.tail(p)
         x = np.arange(p)
-        y = df_slice['收盘'].values
         highs = df_slice['最高'].values
         lows = df_slice['最低'].values
+        closes = df_slice['收盘'].values
         
-        # 1. 【重构】：通过最高价和最低价的各自斜率均值来计算中轴斜率，完美解决“切西瓜”
-        slope_high, _ = np.polyfit(x, highs, 1)
-        slope_low, _ = np.polyfit(x, lows, 1)
-        slope = (slope_high + slope_low) / 2
+        # 估算斜率寻优区间
+        price_span = max(highs.max() - lows.min(), 0.01)
+        max_slope = price_span / p
         
-        y_norm = y / y[0]
-        # 用均值斜率进行大方向过滤
-        slope_norm = slope / y[0]
-        if direction == '下降通道' and slope_norm > -0.001: continue
-        if direction == '上升通道' and slope_norm < 0.001: continue
-        
-        # 中轴截距使用收盘价均值进行锚定
-        intercept = np.mean(y) - slope * np.mean(x)
-        reg_line = slope * x + intercept
-        
-        # 2. 【核心升级】：计算每个 K 线极点（影线尖尖）到理论中轴线的垂直距离
-        dist_high = highs - reg_line
-        dist_low = reg_line - lows
-        
-        # 3. 将理论通道平行移动，精准锚定到第 min_touches 个极值影线上
-        try:
-            upper_offset = np.sort(dist_high)[-min_touches]
-            lower_offset = np.sort(dist_low)[-min_touches]
-        except Exception:
-            continue
+        # 构建旋转直尺的候选斜率池
+        if direction == '下降通道':
+            slopes = np.linspace(-2.0 * max_slope, -0.05 * max_slope, 150)
+        else:
+            slopes = np.linspace(0.05 * max_slope, 2.0 * max_slope, 150)
             
-        if upper_offset <= 0 or lower_offset <= 0: continue
+        best_p_slope = None
+        best_p_score = -1
+        best_p_width = 999999
+        best_p_data = None
         
-        upper_band = reg_line + upper_offset
-        lower_band = reg_line - lower_offset
-        
-        # 4. 【零容忍过滤】：收盘价绝不能突破通道边界！任何一天收盘价在通道外即作废！
-        if strict_close:
-            closes_outside = np.sum((y > upper_band) | (y < lower_band))
-            if closes_outside > 0:
-                continue 
-        
-        # 计算通道真实的波段肉量空间
-        channel_width = (upper_band[-1] - lower_band[-1]) / lower_band[-1] * 100
-        if channel_width < min_width: continue
+        for k in slopes:
+            # 核心公式：寻找能将所有 K 线完美包络在内的截距
+            diffs_high = highs - k * x
+            diffs_low = lows - k * x
             
-        current_close = y[-1]
-        dist_to_lower = (current_close - lower_band[-1]) / lower_band[-1] * 100
-        
-        # 买点判定：目前价格必须在通道底边支撑位附近
-        if require_bottom and (dist_to_lower > 3.0 or dist_to_lower < -2.0): continue
+            b_u = np.max(diffs_high) # 绝对上限界
+            b_d = np.min(diffs_low)  # 绝对下限界
             
-        return {
-            "通道方向": "↘️ 下降震荡" if slope_norm < 0 else "↗️ 上升震荡",
-            "实际天数": f"{p}",
-            "通道空间": f"{channel_width:.1f}%",
-            "上轨触碰": f">= {min_touches}次",
-            "下轨触碰": f">= {min_touches}次",
-            "当前价": round(current_close, 2),
-            "距下轨(买点)": f"{dist_to_lower:.2f}%"
-        }
+            width = b_u - b_d
+            if width <= 0: continue
+            
+            channel_width_pct = width / max(lows.min(), 0.01) * 100
+            if channel_width_pct < min_width: continue
+            
+            # 容错厚度定义为通道总宽度的 3% (模拟手绘画线的粗细)
+            epsilon = 0.03 * width
+            
+            # 计算有多少个真实的最高点/最低点贴在了钢尺边缘上
+            up_touches = np.where(highs >= (k * x + b_u - epsilon))[0]
+            dn_touches = np.where(lows <= (k * x + b_d + epsilon))[0]
+            
+            n_up = len(up_touches)
+            n_dn = len(dn_touches)
+            
+            # 严格筛选：上下两边都必须经历过至少 min_touches 次的有效撞击
+            if n_up < min_touches or n_dn < min_touches:
+                continue
+                
+            # 防止撞击点挤在连续几天内（假通道）。触碰点首尾跨度必须超过通道长度的 25%
+            up_spread = up_touches[-1] - up_touches[0]
+            dn_spread = dn_touches[-1] - dn_touches[0]
+            if up_spread < 0.25 * p or dn_spread < 0.25 * p:
+                continue
+                
+            # 综合评分：撞击点越多越好，通道越窄（越紧凑贴合）越好
+            score = n_up + n_dn
+            if score > best_p_score or (score == best_p_score and channel_width_pct < best_p_width):
+                best_p_score = score
+                best_p_width = channel_width_pct
+                best_p_slope = k
+                best_p_data = {
+                    "slope": k,
+                    "b_u": b_u,
+                    "b_d": b_d,
+                    "channel_width": channel_width_pct,
+                    "up_touches": n_up,
+                    "dn_touches": n_dn,
+                    "p": p
+                }
+                
+        if best_p_data is not None:
+            # 成功在当前周期寻找到完美包络通道！
+            k = best_p_data["slope"]
+            b_d = best_p_data["b_d"]
+            current_close = closes[-1]
+            current_lower_val = k * (p - 1) + b_d
+            dist_to_lower = (current_close - current_lower_val) / max(current_lower_val, 0.01) * 100
+            
+            # 判定当前价格是否在底部的买入带
+            if require_bottom and (dist_to_lower > 3.0 or dist_to_lower < -2.0):
+                continue
+                
+            return {
+                "通道方向": "↘️ 下降通道" if direction == '下降通道' else "↗️ 上升通道",
+                "实际天数": f"{p}",
+                "通道空间": f"{best_p_data['channel_width']:.1f}%",
+                "上轨触碰": f"{best_p_data['up_touches']}次",
+                "下轨触碰": f"{best_p_data['dn_touches']}次",
+                "当前价": round(current_close, 2),
+                "距下轨(买点)": f"{dist_to_lower:.2f}%",
+                "slope": k,
+                "b_u": best_p_data["b_u"],
+                "b_d": b_d
+            }
     return None
 
 def detect_dual_channel(df, max_macro_p=180, max_micro_p=100, direction='下降通道'):
+    """
+    【升级版】双通道嵌套雷达
+    """
     actual_mac = min(max_macro_p, len(df))
     actual_mic = min(max_micro_p, len(df))
     if actual_mac < 60: return None
     
     valid_macros = []
-    # 大通道同样应用极点平移技术与零容忍收盘价约束
+    # 寻找完美包裹大周期的钢尺
     for mac_p in range(actual_mac, 59, -10):
-        df_mac = df.tail(mac_p)
-        x_mac = np.arange(mac_p)
-        y_mac = df_mac['收盘'].values
-        highs_mac = df_mac['最高'].values
-        lows_mac = df_mac['最低'].values
-        
-        slope_high_mac, _ = np.polyfit(x_mac, highs_mac, 1)
-        slope_low_mac, _ = np.polyfit(x_mac, lows_mac, 1)
-        slope_mac = (slope_high_mac + slope_low_mac) / 2
-        
-        slope_mac_norm = slope_mac / y_mac[0]
-        if direction == '下降通道' and slope_mac_norm > -0.001: continue
-        if direction == '上升通道' and slope_mac_norm < 0.001: continue
-        
-        int_mac = np.mean(y_mac) - slope_mac * np.mean(x_mac)
-        reg_mac = slope_mac * x_mac + int_mac
-        
-        dist_low_mac = reg_mac - lows_mac
-        try: lower_offset_mac = np.sort(dist_low_mac)[-3]
-        except: continue
+        res_mac = detect_regression_channel(df, max_period=mac_p, direction=direction, require_bottom=True, min_width=25, min_touches=3)
+        if res_mac:
+            valid_macros.append(res_mac)
+            break
             
-        if lower_offset_mac <= 0: continue
-        lower_mac = reg_mac - lower_offset_mac 
-        
-        # 零容忍：大通道期间收盘价绝不能跌破支撑下轨
-        if np.any(y_mac < lower_mac): continue
-        
-        current_close = y_mac[-1]
-        dist_to_mac_lower = (current_close - lower_mac[-1]) / lower_mac[-1] * 100
-        
-        if -3.0 <= dist_to_mac_lower <= 4.0:
-            valid_macros.append((mac_p, lower_mac, slope_mac_norm, dist_to_mac_lower))
-            break 
-            
-    if not valid_macros:
-        return None
-        
-    mac_p, lower_mac, slope_mac_norm, dist_to_mac_lower = valid_macros[0]
+    if not valid_macros: return None
+    mac_res = valid_macros[0]
+    mac_p = int(mac_res["实际天数"])
     
+    # 在其内部寻找发生破位的小钢尺通道
     for mic_p in range(actual_mic, 19, -5):
-        if mic_p >= mac_p: continue 
-        
-        df_mic = df.tail(mic_p)
-        x_mic = np.arange(mic_p)
-        y_mic = df_mic['收盘'].values
-        highs_mic = df_mic['最高'].values
-        lows_mic = df_mic['最低'].values
-        
-        slope_high_mic, _ = np.polyfit(x_mic, highs_mic, 1)
-        slope_low_mic, _ = np.polyfit(x_mic, lows_mic, 1)
-        slope_mic = (slope_high_mic + slope_low_mic) / 2
-        
-        reg_mic = slope_mic * x_mic + (np.mean(y_mic) - slope_mic * np.mean(x_mic))
-        
-        dist_low_mic = reg_mic - lows_mic
-        try: lower_offset_mic = np.sort(dist_low_mic)[-3]
-        except: continue
-        
-        lower_mic = reg_mic - lower_offset_mic 
-        
-        # 零容忍：小通道期间收盘价绝不能跌破小下轨
-        if np.any(y_mic < lower_mic): continue
-        
-        dist_to_mic_lower = (current_close - lower_mic[-1]) / lower_mic[-1] * 100
-        
-        if dist_to_mic_lower < 1.0:
-            return {
-                "形态": "🪆双通道诱空(破底翻)",
-                "大通道方向": "↘️ 下降" if slope_mac_norm < 0 else "↗️ 上升",
-                "大通道(实)": f"{mac_p}",
-                "小通道(实)": f"{mic_p}",
-                "当前价": round(current_close, 2),
-                "距大下轨(支撑)": f"{dist_to_mac_lower:.2f}%",
-                "距小下轨(破位)": f"{dist_to_mic_lower:.2f}% (诱空)"
-            }
+        if mic_p >= mac_p: continue
+        res_mic = detect_regression_channel(df, max_period=mic_p, direction=direction, require_bottom=False, min_width=15, min_touches=2)
+        if res_mic:
+            # 检查小通道是否在今天被击穿了底边
+            dist_to_mic = float(res_mic["距下轨(买点)"].replace('%', ''))
+            if dist_to_mic < 0.5: # 价格已经跌破或粘在小下轨上
+                return {
+                    "形态": "🪆双通道破底翻(极限洗盘)",
+                    "大通道方向": mac_res["通道方向"],
+                    "大通道(实)": f"{mac_p}",
+                    "小通道(实)": f"{mic_p}",
+                    "当前价": mac_res["当前价"],
+                    "距大下轨(支撑)": mac_res["距下轨(买点)"],
+                    "距小下轨(破位)": f"{dist_to_mic:.2f}% (破底诱空)"
+                }
     return None
 
 # ================= 4. 旧版指标计算保留 =================
@@ -345,8 +336,6 @@ def init_db():
         return False
 
 db_ready = init_db()
-
-st.title("🚀 量化狙击系统: 真实边界平移画线版")
 
 if not db_ready:
     st.error("云端存储环境初始化失败，请稍后刷新重试。")
